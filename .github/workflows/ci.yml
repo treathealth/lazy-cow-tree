@@ -31,7 +31,7 @@ jobs:
       # ruff for the scripts in Nix strings.
       - run: |
           rev=$(jq -r .nodes.statix.locked.rev devenv.lock)
-          nix shell "github:onnimonni/statix/$rev#prebuilt" nixpkgs#shellcheck nixpkgs#ruff \
+          nix shell --inputs-from . "github:onnimonni/statix/$rev#prebuilt" nixpkgs#shellcheck nixpkgs#ruff \
             --command statix check .
 
   e2e:
@@ -46,10 +46,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build
-      # PostgreSQL 18, Redis and jq from nixpkgs; git, curl and python3 from the runner.
-      - run: nix shell nixpkgs#postgresql_18 nixpkgs#redis nixpkgs#jq --command tests/e2e.sh target/debug/lazy-cow-tree
+      # PostgreSQL 18, Redis and jq from the flake.lock's nixpkgs (cached; an unpinned
+      # nixpkgs-unstable can be a build that's broken or not cached yet, e.g. Redis on
+      # macOS); git, curl and python3 from the runner.
+      - run: nix shell --inputs-from . nixpkgs#postgresql_18 nixpkgs#redis nixpkgs#jq --command tests/e2e.sh target/debug/lazy-cow-tree
       # The runner's bash (3.2 on macOS) and nixpkgs' bash 5 and zsh.
-      - run: tests/protect-primary.sh /bin/bash "$(nix build --no-link --print-out-paths nixpkgs#bashInteractive.out)/bin/bash" "$(nix build --no-link --print-out-paths nixpkgs#zsh.out)/bin/zsh"
+      - run: tests/protect-primary.sh /bin/bash "$(nix build --inputs-from . --no-link --print-out-paths nixpkgs#bashInteractive.out)/bin/bash" "$(nix build --inputs-from . --no-link --print-out-paths nixpkgs#zsh.out)/bin/zsh"
 
   nix:
     strategy:
