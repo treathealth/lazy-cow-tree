@@ -1200,7 +1200,6 @@ in
       LAZY_COW_TREE_POSTGRES_BIN = "${postgres}/bin";
       LAZY_COW_TREE_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
       LAZY_COW_TREE_POSTGRES_ROLE_CONNECTIONS = toString cfg.postgres.connectionsPerCheckout;
-      LAZY_COW_TREE_TEST_SLOTS = lib.mkIf (cfg.testSlots.count != null) (toString cfg.testSlots.count);
       LAZY_COW_TREE_POSTGRES_EXTENSIONS = lib.concatStringsSep "," cfg.postgres.createExtensions;
       LAZY_COW_TREE_REDIS_SERVER = lib.getExe' cfg.redis "redis-server";
       LAZY_COW_TREE_POSTGRES_DURABLE =
@@ -1211,6 +1210,9 @@ in
       LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH = pgCfg.copyOnWrite.refresh;
       LAZY_COW_TREE_REDIS_INSTANCE = redisCfg.instance;
       LAZY_COW_TREE_REDIS_START = redisCfg.start.on;
+    }
+    // lib.optionalAttrs (cfg.testSlots.count != null) {
+      LAZY_COW_TREE_TEST_SLOTS = toString cfg.testSlots.count;
     }
     // lib.optionalAttrs (pgCfg.start.idleTimeout != null) {
       LAZY_COW_TREE_POSTGRES_IDLE_TIMEOUT = toString (seconds pgCfg.start.idleTimeout);
