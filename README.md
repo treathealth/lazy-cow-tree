@@ -75,10 +75,10 @@ primary checkout's, nor unchanged since setup finished are printed as warnings.
 
 Binaries (`lazy-cow-tree` and `lazy-cow-tree-cow`) for macOS (arm64) and Linux (x86_64,
 arm64) are on the
-[releases page](https://github.com/onnimonni/devenv-lazy-cow-worktrees/releases); or
-`nix profile install github:onnimonni/devenv-lazy-cow-worktrees` (or `#prebuilt` for the
+[releases page](https://github.com/treathealth/lazy-cow-tree/releases); or
+`nix profile install github:treathealth/lazy-cow-tree` (or `#prebuilt` for the
 release binaries, no build), or
-`cargo install --git https://github.com/onnimonni/devenv-lazy-cow-worktrees`. lazy-cow-tree runs
+`cargo install --git https://github.com/treathealth/lazy-cow-tree`. lazy-cow-tree runs
 `postgres`/`initdb` (18+) and `redis-server` from PATH unless told where they are
 (the devenv module does).
 
@@ -90,7 +90,7 @@ release binaries, no build), or
 # devenv.yaml
 inputs:
   lazy-cow-tree:
-    url: github:onnimonni/devenv-lazy-cow-worktrees   # don't make it follow your nixpkgs
+    url: github:treathealth/lazy-cow-tree   # don't make it follow your nixpkgs
 ```
 
 ```nix
@@ -739,7 +739,7 @@ devenv project and stops those prompts:
 ```nix
 # flake.nix of your nix-darwin configuration
 {
-  inputs.lazy-cow-tree.url = "github:onnimonni/devenv-lazy-cow-worktrees";
+  inputs.lazy-cow-tree.url = "github:treathealth/lazy-cow-tree";
 
   outputs = { nix-darwin, lazy-cow-tree, ... }: {
     darwinConfigurations.my-mac = nix-darwin.lib.darwinSystem {

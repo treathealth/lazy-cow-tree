@@ -3,7 +3,7 @@
 # every project (and every worktree) it sees.
 #
 #   # flake.nix of the nix-darwin configuration
-#   inputs.lazy-cow-tree.url = "github:onnimonni/devenv-lazy-cow-worktrees";
+#   inputs.lazy-cow-tree.url = "github:treathealth/lazy-cow-tree";
 #   darwinConfigurations.<host> = nix-darwin.lib.darwinSystem {
 #     modules = [
 #       inputs.lazy-cow-tree.darwinModules.default

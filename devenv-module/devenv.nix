@@ -3,7 +3,7 @@
 #   # devenv.yaml                              # devenv.nix
 #   inputs:                                    { inputs, ... }: {
 #     lazy-cow-tree:                               imports = [ inputs.lazy-cow-tree.devenvModules.default ];
-#       url: github:onnimonni/devenv-lazy-cow-worktrees      }
+#       url: github:treathealth/lazy-cow-tree      }
 #
 #   (or `flake: false` on the input and `imports: [ lazy-cow-tree/devenv-module ]`)
 #
