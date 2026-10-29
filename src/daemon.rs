@@ -231,6 +231,11 @@ impl Drop for ProjectRt {
 #[derive(Serialize, Deserialize, Default)]
 struct Saved {
     projects: Vec<Project>,
+    /// Each project's provisioned worktrees, by primary checkout: one removed while no
+    /// daemon ran (`git worktree remove` after a reboot) still gets its databases and
+    /// role dropped by the next one.
+    #[serde(default)]
+    known: BTreeMap<PathBuf, BTreeMap<String, Checkout>>,
 }
 
 fn state_file() -> PathBuf {
@@ -392,13 +397,15 @@ impl Daemon {
     }
 
     fn save(&self) {
-        let saved = Saved {
-            projects: self
-                .projects
-                .lock()
-                .values()
-                .map(|p| p.project.clone())
-                .collect(),
+        let saved = {
+            let projects = self.projects.lock();
+            Saved {
+                projects: projects.values().map(|p| p.project.clone()).collect(),
+                known: projects
+                    .values()
+                    .map(|p| (p.project.root.clone(), p.known.lock().clone()))
+                    .collect(),
+            }
         };
         if let Err(e) = serde_json::to_vec_pretty(&saved)
             .map_err(anyhow::Error::from)
@@ -464,12 +471,23 @@ impl Daemon {
         };
         // An earlier registration's worktrees stay connectable (the PostgreSQL proxy
         // refuses unknown roles) until reconcile has provisioned them again.
+        // A first registration (a fresh daemon) takes over only the saved worktrees that
+        // are gone: reconcile drops their databases. Ones still there are provisioned
+        // again (after a reboot their databases went with the RAM disk).
         let known = self
             .projects
             .lock()
             .get(&root)
             .map(|old| old.known.lock().clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                load_saved()
+                    .known
+                    .remove(&root)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(_, c)| !c.path.exists())
+                    .collect()
+            });
         let rt = Arc::new(ProjectRt {
             project,
             base,

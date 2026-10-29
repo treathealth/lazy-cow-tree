@@ -78,6 +78,11 @@ impl Daemon {
         for (name, c) in &known {
             if !current.contains_key(name) {
                 info!("worktree {name} is gone; cleaning up");
+                // As `remove_locked`: its migration stopped and finished first, else its
+                // role still owns what that migration created and can't be dropped.
+                self.servers.stop_checkout(c).await;
+                let lock = rt.migrate_lock(c);
+                let _migrating = lock.lock().await;
                 if let Err(e) = self.deprovision(c).await {
                     // Kept: tried again on the next reconcile.
                     warn!("cleaning up {name}: {e:#}");
@@ -85,6 +90,9 @@ impl Daemon {
                 }
                 rt.known.lock().remove(name);
             }
+        }
+        if *rt.known.lock() != known {
+            self.save();
         }
         Ok(())
     }
@@ -128,6 +136,7 @@ impl Daemon {
         let c = checkout_with(&rt.project, &info, &ports);
         self.provision(&c).await?;
         rt.known.lock().insert(info.name.clone(), c.clone());
+        self.save();
         self.run_setup(rt, &c).await;
         Ok(CreateResp {
             path,
@@ -321,6 +330,7 @@ impl Daemon {
             );
         }
         rt.known.lock().remove(&info.name);
+        self.save();
         info!("removed worktree {}", info.name);
         Ok(warnings)
     }

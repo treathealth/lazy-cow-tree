@@ -477,4 +477,36 @@ eventually 60 test -f "$fresh_marker" || fail "worktree not migrated after the f
   fail "template made from a feature branch"
 pass "fresh primary on a feature branch migrated, template left alone"
 
+# No daemon (a reboot, `devenv up` stopped): `worktree rm` starts one with the saved
+# projects, then removes the worktree and its databases as usual.
+wt_r=$("$bin" worktree new restart-x 2>/dev/null)
+role_r() { [[ -n $(admin_psql "select 1 from pg_roles where rolname = 'demo--restart-x'") ]]; }
+eventually 30 role_r || fail "worktree restart-x not provisioned"
+"$bin" down >/dev/null
+wait "$daemon" 2>/dev/null || true
+daemon=
+LAZY_COW_TREE_NO_AUTOSTART=1 "$bin" worktree rm --force restart-x >/dev/null 2>&1 &&
+  fail "rm without a daemon succeeded with LAZY_COW_TREE_NO_AUTOSTART=1"
+out=$("$bin" worktree rm --force restart-x 2>&1) || fail "rm without a daemon: $out"
+[[ $out == *"wasn't running; started it"* ]] || fail "no autostart notice: $out"
+[[ ! -e $wt_r ]] || fail "worktree restart-x still there"
+role_r_gone() { ! role_r; }
+eventually 30 role_r_gone || fail "restart-x's role survived"
+"$bin" status >/dev/null || fail "the started daemon doesn't answer"
+pass "worktree rm without a daemon: started it, then removed the worktree and its role"
+
+# `git worktree remove` while none runs: the wrapper's reconcile starts one, which
+# remembers the worktree from its saved state and drops its databases and role.
+wgit worktree add -q -b gone-x .claude/worktrees/gone-x
+role_g() { [[ -n $(admin_psql "select 1 from pg_roles where rolname = 'demo--gone-x'") ]]; }
+eventually 30 role_g || fail "worktree gone-x not provisioned"
+db_g() { [[ -n $(admin_psql "select 1 from pg_database where datname = 'demo_dev_gone_x'") ]]; }
+eventually 30 db_g || fail "gone-x's database not cloned"
+"$bin" down >/dev/null
+wgit worktree remove --force .claude/worktrees/gone-x
+git branch -q -D gone-x
+role_g_gone() { ! role_g && ! db_g; }
+eventually 60 role_g_gone || fail "git worktree remove without a daemon: gone-x's role or database survived"
+pass "git worktree remove without a daemon: the started daemon dropped its databases and role"
+
 echo "all passed"

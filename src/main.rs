@@ -65,6 +65,10 @@ enum Cmd {
         /// Any checkout of the project.
         #[arg(long, default_value = ".")]
         path: PathBuf,
+        /// Register no project, only bring back the saved ones: how commands that need
+        /// the daemon start it when none runs.
+        #[arg(long)]
+        saved: bool,
     },
     /// Stand-in for devenv's `devenv-proxy` (DEVENV_PROXY_BINARY): run the daemon on
     /// the ports and control socket devenv asks for. Also runs as
@@ -277,6 +281,7 @@ fn root_of(path: &Path) -> Result<PathBuf> {
 }
 
 async fn create(root: PathBuf, name: String, base: Option<String>) -> Result<daemon::CreateResp> {
+    client::ensure_running(&root).await?;
     client::post("/worktrees", &daemon::CreateReq { root, name, base }).await
 }
 
@@ -297,6 +302,7 @@ fn rm_target(cwd: &Path, name: &str) -> Result<String> {
 async fn remove(root: PathBuf, name: String, force: bool) -> Result<()> {
     // The daemon spares these and their ancestors: the shell, the Claude Code session.
     let keep = worktree::ancestors();
+    client::ensure_running(&root).await?;
     let r: Value = client::post(
         "/worktrees/remove",
         &daemon::RemoveReq {
@@ -409,10 +415,18 @@ async fn main() -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     match cli.command {
-        Cmd::Serve { project, path } => {
+        Cmd::Serve {
+            project,
+            path,
+            saved,
+        } => {
             worktree::drop_marker();
-            let p = project_for(&path, project)?;
-            daemon::serve(cli.global, Some(p)).await
+            let p = if saved {
+                None
+            } else {
+                Some(project_for(&path, project)?)
+            };
+            daemon::serve(cli.global, p).await
         }
         Cmd::DevenvProxy {
             listen,
@@ -452,6 +466,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Reconcile { path } => {
             let root = root_of(&path)?;
+            client::ensure_running(&root).await?;
             client::post::<Value>("/reconcile", &daemon::RootReq { root }).await?;
             Ok(())
         }
@@ -466,6 +481,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Worktree(WorktreeCmd::List) => {
             let root = root_of(&cwd)?;
+            client::ensure_running(&root).await?;
             let s: daemon::Status = client::get("/status").await?;
             let p = s
                 .projects
@@ -614,6 +630,9 @@ async fn main() -> Result<()> {
                 worktree: a.worktree(here.clone()),
                 service: a.service.clone(),
             };
+            if matches!(cmd, ServiceCmd::Start(_) | ServiceCmd::Restart(_)) {
+                client::ensure_running(&root).await?;
+            }
             match cmd {
                 ServiceCmd::Start(a) => {
                     let r: Value = client::post("/service/start", &req(&a)).await?;

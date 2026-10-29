@@ -248,6 +248,18 @@ RAM disk and databases stay), so a newer version's features are never missing. E
 project uses its own GitHub token (the module passes `gh auth token`), whichever
 project started the daemon.
 
+When no daemon runs (after a reboot, or once `devenv up` stopped), the commands that
+need one start it: `worktree new`, `worktree rm` (also after the `gh` wrapper's `gh pr
+merge`), `worktree list`, `reconcile` (the `git` wrapper's, after `worktree add`),
+`service start`/`restart` and the Claude Code worktree hooks. It remembers the
+worktrees it provisioned (in its saved state), so one removed while none ran (`git
+worktree remove`, even outside the wrapper) gets its databases and role dropped once a
+daemon runs again. It comes back with the projects it had saved, their
+settings and tokens from their last `devenv up`, and logs to
+`~/.local/state/lazy-cow-tree/logs/daemon.log`; a later `devenv up` registers with it.
+A project that never ran `devenv up` isn't started for. `LAZY_COW_TREE_NO_AUTOSTART=1`
+turns this off.
+
 **4. Trust the local CA** once: `lazy-cow-tree trust` (macOS keychain, asks for your
 password), for `https://*.localhost`. Node ignores the keychain, so the module also
 sets `NODE_EXTRA_CA_CERTS` to the CA (`$LAZY_COW_TREE_HOME/ca/ca.pem`, default
