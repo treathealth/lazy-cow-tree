@@ -26,7 +26,7 @@ stdenv.mkDerivation {
   inherit version;
 
   src = fetchurl {
-    url = "https://github.com/onnimonni/devenv-lazy-cow-worktrees/releases/download/v${version}/${name}.tar.gz";
+    url = "https://github.com/treathealth/lazy-cow-tree/releases/download/v${version}/${name}.tar.gz";
     hash = release.hashes.${system};
   };
   sourceRoot = name;
@@ -47,7 +47,7 @@ stdenv.mkDerivation {
 
   meta = {
     description = "Worktrees, databases, HTTPS hosts, Redis and LSP for parallel coding agents (release binary)";
-    homepage = "https://github.com/onnimonni/devenv-lazy-cow-worktrees";
+    homepage = "https://github.com/treathealth/lazy-cow-tree";
     license = lib.licenses.mit;
     mainProgram = "lazy-cow-tree";
     platforms = builtins.attrNames release.hashes;
