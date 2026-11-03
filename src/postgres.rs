@@ -16,10 +16,24 @@ pub struct Postgres {
     /// Socket directory (the RAM disk).
     pub dir: PathBuf,
     pub port: u16,
+    /// The server this daemon started (None while it uses one that was running).
     child: Mutex<Option<Child>>,
     /// Set in the session of every CREATE DATABASE from a template: `clone` unless
     /// `file_copy_method` is in the project's postgres settings.
     file_copy_method: String,
+    /// How to start the server again when it's gone (killed, crashed, OOM).
+    launch: Launch,
+    /// Set by `stop`: the daemon is shutting down, don't start it again.
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+/// Everything `start` needs, kept to restart the server.
+#[derive(Clone, Default)]
+struct Launch {
+    ramdisk_mb: u64,
+    durable: bool,
+    bin: Option<PathBuf>,
+    extra: Vec<(String, String)>,
 }
 
 /// postgresql.conf settings lazy-cow-tree starts a cluster with (the project's come
@@ -59,6 +73,41 @@ fn cluster_settings(
     settings
 }
 
+/// The server isn't there (refused, no socket, timed out), as opposed to an error
+/// it answered with.
+fn is_unreachable(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error().is_none() && !e.is_closed()
+}
+
+/// `pid` is a live process named postgres (not one that reused a dead server's pid).
+fn is_postgres(pid: i32) -> bool {
+    if pid <= 0 || unsafe { libc::kill(pid, 0) } != 0 {
+        // ESRCH: gone. EPERM: someone else's process, so not our server either.
+        return false;
+    }
+    process_name(pid).is_none_or(|n| n.starts_with("postgres"))
+}
+
+#[cfg(target_os = "macos")]
+fn process_name(pid: i32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn process_name(pid: i32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Elsewhere a live pid is assumed to be the server (never removes a live one's lock).
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_name(_pid: i32) -> Option<String> {
+    None
+}
+
 /// `name` in PATH, like a shell would find it (but without one).
 pub fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
@@ -89,7 +138,8 @@ impl Postgres {
 
     /// Start the cluster listening on `dir/.s.PGSQL.<port>` only: on the RAM disk
     /// with fsync, synchronous_commit and full_page_writes off, or `durable` in a
-    /// plain directory with PostgreSQL's defaults.
+    /// plain directory with PostgreSQL's defaults. A server already running there
+    /// (from an earlier daemon) is used as is.
     pub async fn start(
         dir: PathBuf,
         port: u16,
@@ -98,12 +148,6 @@ impl Postgres {
         bin: Option<PathBuf>,
         extra: Vec<(String, String)>,
     ) -> Result<Self> {
-        let d = dir.clone();
-        if durable {
-            std::fs::create_dir_all(&d)?;
-        } else {
-            tokio::task::spawn_blocking(move || crate::ramdisk::ensure(&d, ramdisk_mb)).await??;
-        }
         let file_copy_method = match extra.iter().find(|(k, _)| k == "file_copy_method") {
             None => "clone".to_string(),
             Some((_, v)) if v == "clone" || v == "copy" => v.clone(),
@@ -114,16 +158,70 @@ impl Postgres {
             port,
             child: Mutex::new(None),
             file_copy_method,
+            launch: Launch {
+                ramdisk_mb,
+                durable,
+                bin,
+                extra,
+            },
+            stopped: Default::default(),
         };
-        if let Ok(admin) = pg.connect("postgres").await {
+        let mut child = pg.child.lock().await;
+        if let Ok(admin) = pg.try_connect("postgres").await {
             info!("using PostgreSQL already running in {}", pg.dir.display());
             std::fs::write(pg.dir.join("data/pg_hba.conf"), HBA)?;
             admin.batch_execute("SELECT pg_reload_conf()").await?;
-            return Ok(pg);
+        } else {
+            *child = Some(pg.spawn().await?);
         }
+        drop(child);
+        Ok(pg)
+    }
 
+    /// Start the server again if it's gone: killed (macOS memory pressure, `kill -9`),
+    /// crashed, or the one an earlier daemon left running exited. Called by the
+    /// daemon's watchdog and whenever a connection is refused, so nothing waits for a
+    /// daemon restart. A server that is running but not answering yet is waited for,
+    /// never killed.
+    pub async fn ensure_running(&self) -> Result<()> {
+        if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut child = self.child.lock().await;
+        if self.try_connect("postgres").await.is_ok() {
+            return Ok(());
+        }
+        // Ours and still alive (starting up, or recovering after a crash): wait.
+        if let Some(c) = child.as_mut()
+            && c.try_wait()?.is_none()
+        {
+            self.wait_ready(c).await?;
+            return Ok(());
+        }
+        warn!(
+            "PostgreSQL in {} is not running; starting it again",
+            self.dir.display()
+        );
+        *child = Some(self.spawn().await?);
+        Ok(())
+    }
+
+    /// initdb if needed, then run `postgres` and wait until it accepts connections.
+    async fn spawn(&self) -> Result<Child> {
+        let Launch {
+            ramdisk_mb,
+            durable,
+            ref bin,
+            ref extra,
+        } = self.launch;
+        let d = self.dir.clone();
+        if durable {
+            std::fs::create_dir_all(&d)?;
+        } else {
+            tokio::task::spawn_blocking(move || crate::ramdisk::ensure(&d, ramdisk_mb)).await??;
+        }
         let bin = match bin {
-            Some(b) => b,
+            Some(b) => b.clone(),
             None => which("postgres")
                 .context("`postgres` not in PATH; add pkgs.postgresql_18 to devenv.nix packages")?
                 .parent()
@@ -131,7 +229,7 @@ impl Postgres {
                 .to_path_buf(),
         };
         let postgres = bin.join("postgres");
-        let data = pg.dir.join("data");
+        let data = self.dir.join("data");
         if !data.join("PG_VERSION").exists() {
             if data.exists() {
                 std::fs::remove_dir_all(&data)?;
@@ -156,51 +254,54 @@ impl Postgres {
             }
         }
         std::fs::write(data.join("pg_hba.conf"), HBA)?;
+        self.clear_stale_locks(&data)?;
         let version: u32 = std::fs::read_to_string(data.join("PG_VERSION"))?
             .trim()
             .parse()
             .unwrap_or(0);
 
-        let mut settings = cluster_settings(&pg.dir, port, durable);
+        let mut settings = cluster_settings(&self.dir, self.port, durable);
         if version >= 18 {
             // Also the server default, for CREATE DATABASE run by apps and tools.
-            settings.push(("file_copy_method", pg.file_copy_method.clone()));
+            settings.push(("file_copy_method", self.file_copy_method.clone()));
         } else {
             warn!("PostgreSQL {version}: no copy-on-write CREATE DATABASE (needs 18+)");
         }
-        let log = std::fs::File::create(pg.dir.join("postgres.log"))?;
+        let log = std::fs::File::create(self.dir.join("postgres.log"))?;
         let mut cmd = tokio::process::Command::new(&postgres);
         cmd.arg("-D").arg(&data);
         for (k, v) in &settings {
             cmd.arg("-c").arg(format!("{k}={v}"));
         }
         // The project's (lazy-cow-tree.postgres.settings) come last and win.
-        for (k, v) in &extra {
+        for (k, v) in extra {
             cmd.arg("-c").arg(format!("{k}={v}"));
         }
-        let child = cmd
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
             .kill_on_drop(true)
             .spawn()
             .context("starting postgres")?;
-        *pg.child.lock().await = Some(child);
+        self.wait_ready(&mut child).await?;
+        info!(
+            "PostgreSQL {version} on {}/.s.PGSQL.{}",
+            self.dir.display(),
+            self.port
+        );
+        Ok(child)
+    }
 
+    async fn wait_ready(&self, child: &mut Child) -> Result<()> {
         for _ in 0..600 {
-            if pg.connect("postgres").await.is_ok() {
-                info!(
-                    "PostgreSQL {version} on {}/.s.PGSQL.{port}",
-                    pg.dir.display()
-                );
-                return Ok(pg);
+            if self.try_connect("postgres").await.is_ok() {
+                return Ok(());
             }
-            if let Some(c) = pg.child.lock().await.as_mut()
-                && let Some(status) = c.try_wait()?
-            {
+            if let Some(status) = child.try_wait()? {
                 bail!(
                     "postgres exited ({status}); see {}",
-                    pg.dir.join("postgres.log").display()
+                    self.dir.join("postgres.log").display()
                 );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -208,8 +309,46 @@ impl Postgres {
         bail!("postgres did not start within 60 s")
     }
 
+    /// A server that died without shutting down (SIGKILL, power loss) leaves
+    /// `postmaster.pid` and the socket's lock file behind. PostgreSQL ignores them
+    /// when their pid is gone, but refuses to start when the pid was reused by
+    /// another process, which after a reboot or a long uptime is likely: remove them
+    /// unless that pid really is a postgres.
+    fn clear_stale_locks(&self, data: &std::path::Path) -> Result<()> {
+        let pid_file = data.join("postmaster.pid");
+        let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.lines().next()?.trim().parse::<i32>().ok())
+        else {
+            return Ok(());
+        };
+        if is_postgres(pid) {
+            bail!(
+                "a postgres (pid {pid}) owns {} but doesn't answer on {}; stop it (`kill {pid}`) and lazy-cow-tree starts its own",
+                data.display(),
+                self.socket().display()
+            );
+        }
+        info!("removing stale {} (pid {pid} is gone)", pid_file.display());
+        for f in [
+            pid_file,
+            self.socket(),
+            self.dir.join(format!(".s.PGSQL.{}.lock", self.port)),
+        ] {
+            match std::fs::remove_file(&f) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(e).with_context(|| format!("removing {}", f.display()));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Fast shutdown of the cluster this process started.
     pub async fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(mut c) = self.child.lock().await.take() {
             if let Some(pid) = c.id() {
                 unsafe { libc::kill(pid as i32, libc::SIGINT) };
@@ -218,7 +357,21 @@ impl Postgres {
         }
     }
 
+    /// A superuser connection; a refused one starts the server again first.
     pub async fn connect(&self, db: &str) -> Result<tokio_postgres::Client> {
+        match self.try_connect(db).await {
+            Err(e) if is_unreachable(&e) => {
+                self.ensure_running().await?;
+                Ok(self.try_connect(db).await?)
+            }
+            r => Ok(r?),
+        }
+    }
+
+    async fn try_connect(
+        &self,
+        db: &str,
+    ) -> std::result::Result<tokio_postgres::Client, tokio_postgres::Error> {
         let (client, conn) = tokio_postgres::Config::new()
             .host_path(&self.dir)
             .port(self.port)
@@ -754,6 +907,8 @@ mod tests {
             port: 5432,
             child: Mutex::new(Some(child)),
             file_copy_method: "copy".into(),
+            launch: Launch::default(),
+            stopped: Default::default(),
         };
         for _ in 0..100 {
             if pg.connect("postgres").await.is_ok() {
@@ -792,6 +947,91 @@ mod tests {
             .iter()
             .map(|r| r.get(0))
             .collect()
+    }
+
+    /// `Postgres::start` in a fresh durable directory (no RAM disk), as the daemon does.
+    async fn started() -> Option<(Postgres, tempfile::TempDir)> {
+        let bin = which("initdb")?.parent()?.to_path_buf();
+        let tmp = tempfile::Builder::new()
+            .prefix("lfpg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let pg = Postgres::start(tmp.path().to_path_buf(), 5432, 0, true, Some(bin), vec![])
+            .await
+            .unwrap();
+        Some((pg, tmp))
+    }
+
+    fn postmaster_pid(pg: &Postgres) -> i32 {
+        std::fs::read_to_string(pg.dir.join("data/postmaster.pid"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn killed_server_is_started_again() {
+        let Some((pg, _tmp)) = started().await else {
+            eprintln!("no initdb in PATH; skipped");
+            return;
+        };
+        let pid = postmaster_pid(&pg);
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        // Reap it so the pid is really gone (it's our child).
+        let _ = pg.child.lock().await.as_mut().unwrap().wait().await;
+        assert!(pg.try_connect("postgres").await.is_err());
+
+        // A refused connection revives it.
+        pg.connect("postgres").await.unwrap();
+        assert_ne!(postmaster_pid(&pg), pid);
+        pg.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stale_lock_with_reused_pid_is_removed() {
+        let Some((pg, tmp)) = started().await else {
+            eprintln!("no initdb in PATH; skipped");
+            return;
+        };
+        pg.stop().await;
+        drop(pg);
+        // As after SIGKILL + pid reuse: the lock names a live process that isn't postgres
+        // (not this test process: postgres ignores a lock naming its parent).
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let data = tmp.path().join("data");
+        let lock = std::fs::read_to_string(data.join("postmaster.pid")).unwrap_or_default();
+        let rest: String = lock.lines().skip(1).map(|l| format!("{l}\n")).collect();
+        std::fs::write(
+            data.join("postmaster.pid"),
+            format!("{}\n{rest}", other.id()),
+        )
+        .unwrap();
+
+        let bin = which("initdb").unwrap().parent().unwrap().to_path_buf();
+        let pg = Postgres::start(tmp.path().to_path_buf(), 5432, 0, true, Some(bin), vec![])
+            .await
+            .unwrap();
+        assert_ne!(postmaster_pid(&pg), other.id() as i32);
+        pg.stop().await;
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    #[tokio::test]
+    async fn stopped_server_is_not_started_again() {
+        let Some((pg, _tmp)) = started().await else {
+            eprintln!("no initdb in PATH; skipped");
+            return;
+        };
+        pg.stop().await;
+        pg.ensure_running().await.unwrap();
+        assert!(pg.try_connect("postgres").await.is_err());
     }
 
     #[tokio::test]
