@@ -823,6 +823,19 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         up_queue: Mutex::new(Vec::new()),
     });
 
+    // Watchdog: a server killed under the daemon (macOS memory pressure, `kill -9`)
+    // comes back within seconds instead of every checkout failing until a restart.
+    let weak = Arc::downgrade(&d);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let Some(d) = weak.upgrade() else { break };
+            if let Err(e) = d.pg.ensure_running().await {
+                warn!("PostgreSQL: {e:#}");
+            }
+        }
+    });
+
     let weak = Arc::downgrade(&d);
     let resolve: crate::pgproxy::Resolve = Arc::new(move |user, db, client_port| {
         let weak = weak.clone();
