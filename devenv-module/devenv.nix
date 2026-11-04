@@ -1105,7 +1105,7 @@ in
       claude.trustCa = mkOption {
         type = types.bool;
         default = true;
-        description = "Set NODE_EXTRA_CA_CERTS to the local CA in `.claude/settings.local.json`, so Claude Code reaches MCP servers on https://*.localhost. Node reads one file only: to trust other CAs too, set `files.\".claude/settings.local.json\".json.env.NODE_EXTRA_CA_CERTS` to a bundle yourself.";
+        description = "Set NODE_EXTRA_CA_CERTS in `.claude/settings.local.json` to `<home>/ca/ca-bundle.pem` (the public roots plus the local CA, kept by the daemon), so Claude Code reaches MCP servers on https://*.localhost and its own API. Node reads one file only: to trust other CAs too, set `files.\".claude/settings.local.json\".json.env.NODE_EXTRA_CA_CERTS` to a bundle yourself.";
       };
     };
   };
@@ -1332,9 +1332,11 @@ in
           "lazy-cow-tree-lsp@lazy-cow-tree" = true;
         };
 
-        # Node (Claude Code) ignores the keychain `lazy-cow-tree trust` writes to.
+        # Node (Claude Code) ignores the keychain `lazy-cow-tree trust` writes to, and
+        # reads one file: the bundle (public roots + local CA), not ca.pem alone,
+        # or it can't verify its own API.
         env = lib.mkIf (cfg.claude.trustCa && cfg.home != null) {
-          NODE_EXTRA_CA_CERTS = lib.mkDefault "${cfg.home}/ca/ca.pem";
+          NODE_EXTRA_CA_CERTS = lib.mkDefault "${cfg.home}/ca/ca-bundle.pem";
         };
 
         hooks = {
