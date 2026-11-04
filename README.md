@@ -262,8 +262,11 @@ turns this off.
 
 **4. Trust the local CA** once: `lazy-cow-tree trust` (macOS keychain, asks for your
 password), for `https://*.localhost`. Node ignores the keychain, so the module also
-sets `NODE_EXTRA_CA_CERTS` to the CA (`$LAZY_COW_TREE_HOME/ca/ca.pem`, default
-`~/.local/state/lazy-cow-tree/ca/ca.pem`) in `.claude/settings.local.json`'s `env`:
+sets `NODE_EXTRA_CA_CERTS` to a bundle of the public roots plus the CA
+(`$LAZY_COW_TREE_HOME/ca/ca-bundle.pem`, default `~/.local/state/lazy-cow-tree/ca/ca-bundle.pem`,
+rewritten by the daemon from `SSL_CERT_FILE`, `NIX_SSL_CERT_FILE` or the OS bundle) in the checkout
+environment and `.claude/settings.local.json`'s `env`. The CA alone would leave Claude Code unable to
+verify its own API (`UNABLE_TO_GET_ISSUER_CERT_LOCALLY`).
 Claude Code then connects to MCP servers behind lazy-cow-tree (e.g. Tidewave at
 `https://web.<project>.localhost/tidewave/mcp`) instead of failing with
 `SELF_SIGNED_CERT_IN_CHAIN`. Node takes a single file there: to trust another CA too,

@@ -67,6 +67,11 @@ pub fn ca_cert_path() -> PathBuf {
     home().join("ca/ca.pem")
 }
 
+/// The public roots plus the local CA, for NODE_EXTRA_CA_CERTS (`tls::Ca::load_or_create`).
+pub fn ca_bundle_path() -> PathBuf {
+    home().join("ca/ca-bundle.pem")
+}
+
 /// Per-machine random secret that checkout passwords derive from, created on first
 /// use (0600), so the shell hook and the daemon agree without talking.
 pub fn secret() -> Result<Vec<u8>> {

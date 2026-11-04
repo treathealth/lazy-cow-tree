@@ -84,6 +84,7 @@ impl Ca {
             );
             (cert.pem(), key)
         };
+        write_node_bundle(dir, &cert_pem, &system_roots())?;
         let cert_der = rustls_pemfile_cert(&cert_pem)?;
         Ok(Self {
             issuer: Issuer::new(ca_params(), key),
@@ -216,6 +217,49 @@ pub fn trust(ca: &Ca) -> Result<bool> {
     Ok(true)
 }
 
+/// The public roots NODE_EXTRA_CA_CERTS's bundle starts with: the PEM bundle a
+/// devenv or Nix shell points at, else the OS's.
+fn system_roots() -> Option<String> {
+    let env = ["SSL_CERT_FILE", "NIX_SSL_CERT_FILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(std::path::PathBuf::from);
+    let os = [
+        "/etc/ssl/cert.pem",                  // macOS, Alpine
+        "/etc/ssl/certs/ca-certificates.crt", // Debian, NixOS
+        "/etc/pki/tls/certs/ca-bundle.crt",   // Fedora
+    ]
+    .into_iter()
+    .map(std::path::PathBuf::from);
+    env.chain(os)
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .find(|pem| pem.contains("-----BEGIN CERTIFICATE-----"))
+}
+
+/// `<dir>/ca-bundle.pem`, what NODE_EXTRA_CA_CERTS points at: the public roots
+/// plus the local CA. Node takes one file there, so the CA alone left Claude Code
+/// and other Node clients without the roots of their own APIs ("unable to get
+/// issuer certificate") whenever their built-in store fell short.
+fn write_node_bundle(dir: &Path, ca_pem: &str, roots: &Option<String>) -> Result<()> {
+    let bundle = match roots {
+        Some(roots) => format!("{}\n{ca_pem}", roots.trim_end()),
+        None => {
+            tracing::warn!(
+                "no system CA bundle found; {} holds only the local CA",
+                dir.join("ca-bundle.pem").display()
+            );
+            ca_pem.to_string()
+        }
+    };
+    let path = dir.join("ca-bundle.pem");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(bundle.as_str()) {
+        let tmp = dir.join("ca-bundle.pem.tmp");
+        std::fs::write(&tmp, &bundle)?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn trust(_ca: &Ca) -> Result<bool> {
     anyhow::bail!(
@@ -227,6 +271,36 @@ pub fn trust(_ca: &Ca) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_bundle_is_the_public_roots_then_the_local_ca() {
+        let d = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create(d.path()).unwrap();
+        let ca_pem = std::fs::read_to_string(d.path().join("ca.pem")).unwrap();
+        let roots = "-----BEGIN CERTIFICATE-----\nROOT\n-----END CERTIFICATE-----\n";
+
+        write_node_bundle(d.path(), &ca_pem, &Some(roots.into())).unwrap();
+        let bundle = std::fs::read_to_string(d.path().join("ca-bundle.pem")).unwrap();
+        assert!(bundle.starts_with(roots.trim_end()));
+        assert!(bundle.ends_with(&ca_pem));
+
+        // No system bundle: the CA alone (still better than nothing).
+        write_node_bundle(d.path(), &ca_pem, &None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("ca-bundle.pem")).unwrap(),
+            ca_pem
+        );
+        drop(ca);
+    }
+
+    #[test]
+    fn load_or_create_writes_the_bundle() {
+        let d = tempfile::tempdir().unwrap();
+        Ca::load_or_create(d.path()).unwrap();
+        let ca_pem = std::fs::read_to_string(d.path().join("ca.pem")).unwrap();
+        let bundle = std::fs::read_to_string(d.path().join("ca-bundle.pem")).unwrap();
+        assert!(bundle.ends_with(&ca_pem));
+    }
 
     #[test]
     fn keeps_its_own_ca_and_replaces_one_made_under_another_name() {

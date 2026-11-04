@@ -710,7 +710,7 @@ impl Checkout {
             ),
             (
                 "NODE_EXTRA_CA_CERTS".into(),
-                ca_cert_path().display().to_string(),
+                ca_bundle_path().display().to_string(),
             ),
         ];
         for kind in &self.extra_dbs {
