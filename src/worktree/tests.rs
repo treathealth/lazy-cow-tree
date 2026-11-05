@@ -734,3 +734,43 @@ fn tcp_clients_are_found_by_their_port() {
         Some(1)
     );
 }
+
+#[test]
+fn new_branch_catches_up_with_the_fetch() {
+    let (dir, project, syncer) = fixture();
+    let root = &project.root;
+    let upstream_path = dir.path().join("upstream");
+    let upstream = Repository::clone(root.to_str().unwrap(), &upstream_path).unwrap();
+    // Upstream moves on: a.txt gone, b.txt new.
+    std::fs::remove_file(upstream_path.join("a.txt")).unwrap();
+    std::fs::write(upstream_path.join("b.txt"), "b\n").unwrap();
+    let mut idx = upstream.index().unwrap();
+    idx.remove_path(Path::new("a.txt")).unwrap();
+    idx.add_path(Path::new("b.txt")).unwrap();
+    idx.write().unwrap();
+    let tree = upstream.find_tree(idx.write_tree().unwrap()).unwrap();
+    let sig = Signature::now("T", "t@example.com").unwrap();
+    let parent = upstream.head().unwrap().peel_to_commit().unwrap();
+    let ahead = upstream
+        .commit(Some("HEAD"), &sig, &sig, "ahead", &tree, &[&parent])
+        .unwrap();
+
+    let repo = Repository::open(root).unwrap();
+    repo.remote("origin", upstream_path.to_str().unwrap())
+        .unwrap();
+    // A stale remote-tracking ref of another branch: fetching the base leaves it.
+    let start = parent.id();
+    repo.reference("refs/remotes/origin/main", start, true, "stale")
+        .unwrap();
+    repo.reference("refs/remotes/origin/other", start, true, "other")
+        .unwrap();
+
+    let path = create(&project, &syncer, "feat", None).unwrap();
+    let wt = Repository::open(&path).unwrap();
+    assert_eq!(wt.head().unwrap().target(), Some(ahead));
+    assert!(!path.join("a.txt").exists());
+    assert_eq!(std::fs::read_to_string(path.join("b.txt")).unwrap(), "b\n");
+    assert!(path.join("cache/big").exists(), "carried cache kept");
+    assert!(!is_dirty(&path).unwrap());
+    assert!(repo.find_reference("refs/remotes/origin/other").is_ok());
+}

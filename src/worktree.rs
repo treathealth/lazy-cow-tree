@@ -178,6 +178,10 @@ pub fn create(
 
     let repo = Repository::open(root)?;
     let branch_exists = repo.find_branch(branch, BranchType::Local).is_ok();
+    // The base branch is fetched while the worktree is filled from the local refs; the
+    // new branch then catches up with what the fetch brought.
+    let mut fetching = None;
+    let mut fetch = None;
     if branch_exists {
         if base.is_some() {
             bail!("branch {branch} already exists; drop the base to check it out");
@@ -190,31 +194,16 @@ pub fn create(
                 .with_context(|| format!("unknown base {b}"))?
                 .peel_to_commit()?,
             None => {
-                if let Err(e) = syncer.fetch(&repo) {
-                    warn!("fetch failed, using local refs: {e:#}");
-                }
-                let local = repo
-                    .find_reference(&format!("refs/heads/{}", syncer.base))
-                    .and_then(|r| r.peel_to_commit())
-                    .ok();
-                let remote = repo
-                    .find_reference(&format!("refs/remotes/{}/{}", syncer.remote, syncer.base))
-                    .and_then(|r| r.peel_to_commit())
-                    .ok();
-                match (local, remote) {
-                    (Some(l), Some(r)) => {
-                        if l.id() == r.id() || repo.graph_descendant_of(l.id(), r.id())? {
-                            l
-                        } else {
-                            r
-                        }
-                    }
-                    (Some(c), None) | (None, Some(c)) => c,
-                    (None, None) => repo.head()?.peel_to_commit()?,
-                }
+                let start = start_commit(&repo, syncer)?;
+                let (s, root) = (syncer.clone(), root.clone());
+                fetching = Some(std::thread::spawn(move || {
+                    s.fetch_base(&Repository::open(&root)?)
+                }));
+                start
             }
         };
         repo.branch(branch, &commit, false)?;
+        fetch = fetching.map(|f| (f, commit.id()));
     }
 
     // A stale admin dir (worktree deleted by hand) would make the add fail.
@@ -231,7 +220,72 @@ pub fn create(
         .find(|(k, _)| k == cow::GENERATED_FILES_ENV)
         .map_or("", |(_, v)| v.as_str());
     cow::populate(root, &path, name, generated)?;
+    if let Some((fetch, started)) = fetch {
+        match fetch.join() {
+            Ok(Ok(())) => {
+                if let Err(e) = catch_up(root, &path, syncer, branch, started) {
+                    warn!(
+                        "worktree {name}: not moved to the fetched {}: {e:#}",
+                        syncer.base
+                    );
+                }
+            }
+            Ok(Err(e)) => warn!("fetch failed, using local refs: {e:#}"),
+            Err(_) => warn!("fetch failed, using local refs"),
+        }
+    }
     Ok(path.canonicalize()?)
+}
+
+/// Where a new branch without a base starts: the base branch, local or the remote's,
+/// whichever is ahead (the local one when it only adds commits on top).
+fn start_commit<'r>(repo: &'r Repository, syncer: &Syncer) -> Result<git2::Commit<'r>> {
+    let local = repo
+        .find_reference(&format!("refs/heads/{}", syncer.base))
+        .and_then(|r| r.peel_to_commit())
+        .ok();
+    let remote = repo
+        .find_reference(&format!("refs/remotes/{}/{}", syncer.remote, syncer.base))
+        .and_then(|r| r.peel_to_commit())
+        .ok();
+    Ok(match (local, remote) {
+        (Some(l), Some(r)) => {
+            if l.id() == r.id() || repo.graph_descendant_of(l.id(), r.id())? {
+                l
+            } else {
+                r
+            }
+        }
+        (Some(c), None) | (None, Some(c)) => c,
+        (None, None) => repo.head()?.peel_to_commit()?,
+    })
+}
+
+/// Move the new `branch`, still at `started`, to where the fetched refs start it:
+/// only the files that differ are written.
+fn catch_up(root: &Path, path: &Path, syncer: &Syncer, branch: &str, started: Oid) -> Result<()> {
+    let repo = Repository::open(root)?;
+    let target = start_commit(&repo, syncer)?;
+    if target.id() == started {
+        return Ok(());
+    }
+    let wt = Repository::open(path)?;
+    let mut head = wt.find_reference(&format!("refs/heads/{branch}"))?;
+    if head.target() != Some(started) {
+        return Ok(());
+    }
+    // Against HEAD's tree (still `started`): files gone from `target` are deleted.
+    wt.checkout_tree(
+        wt.find_commit(target.id())?.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )?;
+    head.set_target(target.id(), "lazy-cow-tree: start at the fetched base")?;
+    info!(
+        "{branch}: started at the fetched {} ({})",
+        syncer.base,
+        &target.id().to_string()[..7]
+    );
+    Ok(())
 }
 
 /// `git worktree lock`ed: automatic removal leaves it alone.
