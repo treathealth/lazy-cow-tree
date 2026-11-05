@@ -10,6 +10,7 @@ use git2::{
 };
 use tracing::{debug, info, warn};
 
+#[derive(Clone)]
 pub struct Syncer {
     /// Main checkout (not a linked worktree).
     pub path: PathBuf,
@@ -93,6 +94,12 @@ impl Syncer {
 
     pub fn fetch(&self, repo: &Repository) -> Result<()> {
         self.fetch_refspecs(repo, &[])
+    }
+
+    /// Fetch only the base branch (into `refs/remotes/<remote>/<base>`).
+    pub fn fetch_base(&self, repo: &Repository) -> Result<()> {
+        let (r, b) = (&self.remote, &self.base);
+        self.fetch_refspecs(repo, &[format!("+refs/heads/{b}:refs/remotes/{r}/{b}")])
     }
 
     /// Fetch `refspecs` from the remote (none: its configured ones).

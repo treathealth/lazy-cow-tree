@@ -22,6 +22,9 @@ lazy_cow_tree=@lazyCowTree@
 # FORCE_* variables: set to 1 (true, yes); 0, false or empty is off.
 truthy() { case ${1:-} in 1 | [Tt]rue | TRUE | [Yy]es | YES) return 0 ;; esac; return 1; }
 
+# Device number of a path (GNU stat, else BSD's).
+device() { stat -c %d "$1" 2>/dev/null || stat -f %d "$1"; }
+
 # Tell the daemon (if running) to provision new worktrees / clean up removed ones.
 reconcile() { ("$lazy_cow_tree" reconcile --path "$1" >/dev/null 2>&1 &) }
 
@@ -102,8 +105,34 @@ case ${2:-} in
         exit 1
       fi
     fi
+    # git deletes every file itself: seconds for the caches the fill carried in
+    # (node_modules, _build, … thousands of clones). Like `lazy-cow-tree worktree rm`,
+    # they go to the trash first (a rename; same volume only) and are deleted in the
+    # background. Put back if git refuses.
+    moved=()
+    if [[ -n $wt && -d $wt ]] &&
+      admin=$("$real_git" -C "$wt" rev-parse --absolute-git-dir 2>/dev/null) &&
+      [[ -s $admin/lazy-cow-tree-populated ]] &&
+      common=$("$real_git" -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+      [[ $(device "$wt") == "$(device "$common")" ]] &&
+      real_wt=$(cd "$wt" && pwd -P) &&
+      trash=$common/lazy-cow-tree-trash/${admin##*/}.$$ && mkdir -p "$trash"; then
+      while IFS= read -r rel; do
+        [[ -n $rel && /$rel/ != */../* ]] || continue
+        [[ -d $wt/$rel && ! -L $wt/$rel ]] || continue # small files: git is quicker
+        # Never through a symlinked parent: only what is inside the worktree.
+        [[ $rel != */* || $(cd "$wt/${rel%/*}" 2>/dev/null && pwd -P) == "$real_wt/${rel%/*}" ]] ||
+          continue
+        mv "$wt/$rel" "$trash/${#moved[@]}" 2>/dev/null && moved+=("$rel")
+      done <"$admin/lazy-cow-tree-populated"
+    fi
     "$real_git" "${globals[@]}" "$@"
     status=$?
+    if ((status)); then
+      for i in "${!moved[@]}"; do mv "$trash/$i" "$wt/${moved[$i]}"; done
+      rmdir "$trash" 2>/dev/null
+    fi
+    [[ -n ${trash:-} && -d $trash ]] && (rm -rf "$trash" &)
     reconcile "$base"
     exit $status ;;
   prune | move)
@@ -114,6 +143,11 @@ case ${2:-} in
   *) exec "$real_git" "${globals[@]}" "$@" ;;
 esac
 shift 2
+
+# Parallel checkout (a worker per CPU) for the checkouts git does here, unless configured.
+parallel=()
+"$real_git" "${globals[@]}" config checkout.workers >/dev/null ||
+  parallel=(-c checkout.workers=0)
 
 # `git worktree add` options: find <path>, drop --checkout (we add --no-checkout),
 # keep the caller's --lock / --reason for after the fill
@@ -152,7 +186,15 @@ done
 # A new branch with no start point would start at HEAD, which may lag the remote: fetch
 # the base branch (like `lazy-cow-tree worktree new`) and start at <remote>/<base> when
 # HEAD is that or behind it (HEAD's own commits keep it: a feature branch, unpushed work).
+# The fetch runs while the worktree is filled from the local refs; the branch then
+# catches up with what it brought (only the files that differ are written).
 remote=${LAZY_COW_TREE_REMOTE:-origin}
+fetch_pid=
+start_at_upstream() {
+  [[ -n $new_branch ]] &&
+    "$real_git" "${globals[@]}" rev-parse -q --verify "$upstream" >/dev/null &&
+    "$real_git" "${globals[@]}" merge-base --is-ancestor HEAD "$upstream" 2>/dev/null
+}
 if [[ -z $commitish && -z $detach ]] &&
   "$real_git" "${globals[@]}" remote get-url "$remote" >/dev/null 2>&1; then
   base_branch=${LAZY_COW_TREE_BASE:-}
@@ -161,8 +203,8 @@ if [[ -z $commitish && -z $detach ]] &&
     base_branch=${base_branch#"$remote"/}
   fi
   base_branch=${base_branch:-main}
-  "$real_git" "${globals[@]}" fetch -q "$remote" "$base_branch" ||
-    echo "warning: fetching $remote $base_branch failed; using local refs" >&2
+  "$real_git" "${globals[@]}" fetch -q "$remote" "$base_branch" &
+  fetch_pid=$!
   # git's own default: a new branch named after the directory, unless one exists.
   if [[ -z $new_branch ]] &&
     ! "$real_git" "${globals[@]}" show-ref -q --verify "refs/heads/${path##*/}" &&
@@ -171,25 +213,40 @@ if [[ -z $commitish && -z $detach ]] &&
     args=(-b "$new_branch" "${args[@]}")
   fi
   upstream=refs/remotes/$remote/$base_branch
-  if [[ -n $new_branch ]] &&
-    "$real_git" "${globals[@]}" rev-parse -q --verify "$upstream" >/dev/null &&
-    "$real_git" "${globals[@]}" merge-base --is-ancestor HEAD "$upstream" 2>/dev/null; then
+  if start_at_upstream; then
     # Not tracking <remote>/<base>: `git push` would aim at it.
     args=(--no-track "${args[@]}" "$remote/$base_branch")
   fi
 fi
 
+# Waits for the fetch (its warning before git's own output ends).
+fetched() {
+  [[ -n $fetch_pid ]] || return 1
+  wait "$fetch_pid" && return 0
+  echo "warning: fetching $remote $base_branch failed; using local refs" >&2
+  return 1
+}
+
 "$real_git" "${globals[@]}" worktree add --no-checkout \
-  --lock --reason "initializing (lazy-cow-tree)" "${args[@]}" || exit $?
+  --lock --reason "initializing (lazy-cow-tree)" "${args[@]}" || { status=$?; fetched; exit $status; }
 
 [[ $path == /* ]] || path=$base/$path
 worktree=$(cd "$path" && pwd -P) || exit 1
 # The worktree git just created is ours; don't let the caller's GIT_DIR point elsewhere.
-wt_git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "$real_git" -C "$worktree" "$@"; }
+wt_git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "$real_git" -C "$worktree" "${parallel[@]}" "$@"; }
 
 if ! "$cow" populate ${quiet:+-q} "$worktree"; then
   echo "copy-on-write fill failed: falling back to a regular checkout" >&2
   wt_git reset --hard --no-recurse-submodules -q || status=$?
+fi
+
+# Catch up with the fetch: the start point it would have chosen.
+if fetched && [[ -n $new_branch && -z ${status:-} ]]; then
+  if start_at_upstream; then start=$upstream; else start=HEAD; fi
+  start=$("$real_git" "${globals[@]}" rev-parse -q --verify "$start^{commit}")
+  if [[ -n $start && $start != "$(wt_git rev-parse -q --verify HEAD)" ]]; then
+    wt_git reset --hard --no-recurse-submodules -q "$start" || status=$?
+  fi
 fi
 
 wt_git worktree unlock "$worktree"

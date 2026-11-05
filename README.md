@@ -530,8 +530,10 @@ All services of a checkout share its `DATABASE_URL` and `REDIS_URL` for now
 ## New worktrees, however they're made
 
 In the devenv shell `git` is the module's wrapper (`lazyCowTree.git.enable`):
-`git worktree add` first fetches the base branch (`$LAZY_COW_TREE_BASE`, else the
-remote's default branch, else `main`; offline: only a warning). A new branch without a
+`git worktree add` fetches the base branch (`$LAZY_COW_TREE_BASE`, else the
+remote's default branch, else `main`; offline: only a warning) while it fills the
+worktree, then brings a new branch up to what was fetched (only the files that differ
+are written, with parallel checkout). A new branch without a
 start point (`-b x path`, or git's implicit one named after the directory) then starts
 at `origin/<base>` instead of a stale local `HEAD`, without tracking it; a `HEAD` with
 commits of its own (a feature branch, unpushed work) stays the start, like git's. It
@@ -549,7 +551,9 @@ devenv later writes them into (direnv) has no untracked files. Then it asks the
 daemon to provision it (`lazy-cow-tree reconcile`, in the background), which runs
 `lazyCowTree.setup` once in it. `git worktree remove`, `prune` and `move` ask it to
 reconcile too, which drops a removed worktree's databases, role and redis-server.
-With a GitHub `origin`, `git worktree remove` refuses while the worktree's branch has an
+`git worktree remove` moves the caches the fill carried in to the git dir's trash first
+(same volume only; put back if git refuses) and deletes them in the background, like
+`lazy-cow-tree worktree rm`: git itself deletes only the rest. With a GitHub `origin`, `git worktree remove` refuses while the worktree's branch has an
 open pull request (checked with `gh`; one error line naming the PR); a merged, closed
 or missing PR removes it as usual, and if `gh` can't tell (not logged in, offline) it
 removes it too. `FORCE_ALLOW_OPEN_PR=1` skips the check. It also refuses while something
