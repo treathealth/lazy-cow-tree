@@ -120,7 +120,7 @@ async fn serves_devenv_clients_over_a_private_socket() {
     let routes = DevenvRoutes::default();
     let server = tokio::spawn({
         let (socket, routes) = (socket.clone(), routes.clone());
-        async move { serve(&socket, routes).await }
+        async move { serve(&socket, None, routes).await }
     });
     let ask = |body: &'static str| {
         let socket = socket.clone();
@@ -151,7 +151,7 @@ async fn serves_devenv_clients_over_a_private_socket() {
         0o600
     );
     // A second daemon refuses the live socket instead of stealing it.
-    assert!(serve(&socket, DevenvRoutes::default()).await.is_err());
+    assert!(serve(&socket, None, DevenvRoutes::default()).await.is_err());
     server.abort();
 }
 
@@ -160,6 +160,6 @@ async fn never_replaces_a_regular_file() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("proxy.sock");
     std::fs::write(&socket, "keep me").unwrap();
-    assert!(serve(&socket, DevenvRoutes::default()).await.is_err());
+    assert!(serve(&socket, None, DevenvRoutes::default()).await.is_err());
     assert_eq!(std::fs::read_to_string(socket).unwrap(), "keep me");
 }

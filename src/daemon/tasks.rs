@@ -67,6 +67,28 @@ pub(super) async fn ticker(rt: Arc<ProjectRt>) {
         }
         // Retries checkouts whose provisioning failed.
         rt.trigger(&rt.pending.reconcile);
+        // Erlang/Elixir nodes an agent started in a worktree and forgot.
+        if let Some(after) = rt.project.settings.stop_idle_nodes_after {
+            let dirs: Vec<(String, PathBuf)> = rt
+                .known
+                .lock()
+                .values()
+                .map(|c| (c.id(), c.path.clone()))
+                .collect();
+            let _ = tokio::task::spawn_blocking(move || {
+                for (id, dir) in dirs {
+                    for l in worktree::kill_idle_beams(&dir, &[], after) {
+                        info!(
+                            "{id}: stopped pid {} ({}): nobody used it for {} min",
+                            l.pid,
+                            l.command.chars().take(80).collect::<String>(),
+                            l.activity.map_or(0, |a| a.idle_s) / 60
+                        );
+                    }
+                }
+            })
+            .await;
+        }
         if !rt.ws_ok.load(Ordering::SeqCst) || n.is_multiple_of(10) {
             rt.pending.merged.store(true, Ordering::SeqCst);
             rt.trigger(&rt.pending.sync);

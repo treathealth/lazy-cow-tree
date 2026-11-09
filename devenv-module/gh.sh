@@ -6,7 +6,7 @@
 # keeps them as `<name>-kept-<sha>`, then removes it). Every other command is the real gh.
 #
 # `gh pr merge` refuses while the PR has unresolved review conversations, or while that
-# worktree has uncommitted changes.
+# worktree has uncommitted changes. What still runs in that worktree is killed with it.
 #
 #   LAZY_COW_TREE_GH_DISABLE=1  plain gh
 #   FORCE_ALLOW_UNRESOLVED=1    `gh pr merge` even with unresolved review conversations
@@ -100,7 +100,13 @@ if [[ $2 == merge && -n $dirty ]] && ! truthy "${FORCE_ALLOW_DIRTY_MERGE:-}"; th
   exit 1
 fi
 
-"$real_gh" "$@"
+# After merging, gh removes the branch's worktree itself (`git worktree remove`, through
+# the git wrapper): what still runs there runs merged code, busy or not.
+if [[ $2 == merge ]]; then
+  FORCE_KILL_PROCESSES=1 "$real_gh" "$@"
+else
+  "$real_gh" "$@"
+fi
 status=$?
 
 # `--delete-branch` may fail on the local branch (checked out in a worktree) after
@@ -108,6 +114,11 @@ status=$?
 read -r state branch < <(pr)
 [[ $state == MERGED || $state == CLOSED ]] || exit "$status"
 
+if [[ ! -d $wt ]]; then
+  echo "PR $state: worktree $wt removed" >&2
+  [[ $PWD == "$wt" || $PWD == "$wt"/* ]] && echo "you were in it: cd $first" >&2
+  exit "$status"
+fi
 echo "PR $state: removing worktree $wt" >&2
 if [[ -n $dirty ]]; then
   echo "kept: $wt has uncommitted changes; \`lazy-cow-tree worktree rm --force $wt\` deletes them" >&2

@@ -12,12 +12,14 @@
 //!
 //! See README.md, `lazy-cow-tree --help` and devenv-module/devenv.nix.
 
+mod beam;
 mod client;
 mod config;
 mod cow;
 mod daemon;
 mod devenv_proxy;
 mod github;
+mod handoff;
 mod lsp;
 mod pgproxy;
 mod postgres;
@@ -69,6 +71,9 @@ enum Cmd {
         /// the daemon start it when none runs.
         #[arg(long)]
         saved: bool,
+        /// Take over from the running daemon even when it isn't older.
+        #[arg(long, hide = true)]
+        replace: bool,
     },
     /// Stand-in for devenv's `devenv-proxy` (DEVENV_PROXY_BINARY): run the daemon on
     /// the ports and control socket devenv asks for. Also runs as
@@ -123,6 +128,10 @@ enum Cmd {
     /// The Let's Encrypt certificate of the project's domain (`lazyCowTree.tls`).
     #[command(subcommand)]
     Cert(CertCmd),
+    /// Replace the daemon with a new one of this version, keeping its ports open
+    /// (requests wait instead of failing), databases and worktrees. Services start
+    /// again on their next request.
+    Restart,
     /// Stop the daemon; --eject also drops the RAM disk with every database.
     Down {
         #[arg(long)]
@@ -185,9 +194,14 @@ enum WorktreeCmd {
     /// For the `git` wrapper's `worktree remove`.
     Procs {
         path: PathBuf,
-        /// SIGKILL them (with their descendants) first; lists what survived.
+        /// SIGKILL them (with their descendants) first, but someone's terminal session (a
+        /// process with a controlling terminal, and its parents there); lists what survived.
         #[arg(long)]
         kill: bool,
+        /// SIGKILL first the Erlang/Elixir nodes nobody uses (no clients, no shell,
+        /// idle for a minute: the devenv module's probe tells), listed on stderr.
+        #[arg(long, conflicts_with = "kill")]
+        kill_idle: bool,
     },
 }
 
@@ -255,6 +269,9 @@ impl ServiceArgs {
 
 #[derive(Subcommand)]
 enum HookCmd {
+    /// SessionStart: starts the daemon (or replaces an older one) and tells the agent
+    /// how to work with lazy-cow-tree (stdout goes into its context).
+    SessionStart,
     /// WorktreeCreate: {"name": ...} -> prints the path.
     WorktreeCreate,
     /// WorktreeRemove: {"worktree_path": ...}
@@ -319,6 +336,38 @@ async fn remove(root: PathBuf, name: String, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// What an agent session is told at its start (Claude Code's SessionStart hook):
+/// enough to fix the daemon itself instead of asking the user.
+fn agent_notes(problem: Option<String>) -> String {
+    let mut s = String::from(
+        "This project uses lazy-cow-tree: one daemon per user runs every worktree's services \
+         (https://<worktree>.<service>.<project>.localhost, started by their first request), \
+         PostgreSQL and Redis.
+- `lazy-cow-tree status`: URLs, services, migration and setup errors, daemon version.
+- `lazy-cow-tree service log [--service <name>]`: a service's log.
+- A URL refusing connections, or the daemon failing: run \
+`lazy-cow-tree restart` yourself, without asking. It keeps databases, worktrees and the ports; \
+requests wait meanwhile, and services start again on their next request.
+- Never run `lazy-cow-tree down --eject`: it deletes every database. Only on the user's request.
+",
+    );
+    if let Some(p) = problem {
+        s.push_str(&format!(
+            "- At session start the daemon wasn't working: {p}\n  Run `lazy-cow-tree restart`; if it fails, report its error to the user.\n"
+        ));
+    }
+    s
+}
+
+/// `95` -> "1 min", `7200` -> "2 h".
+fn human_duration(s: u64) -> String {
+    match s {
+        0..60 => format!("{s} s"),
+        60..7200 => format!("{} min", s / 60),
+        _ => format!("{} h", s / 3600),
+    }
+}
+
 /// A command line on one line, at most 120 characters.
 fn short_command(c: &str) -> String {
     let c = c.replace(['\n', '\r'], " ");
@@ -330,8 +379,8 @@ fn short_command(c: &str) -> String {
 
 fn print_status(s: &daemon::Status) {
     println!(
-        "daemon {} · postgres 127.0.0.1:{} · redis 127.0.0.1:{} · https :{}",
-        s.pid, s.pg_port, s.redis_port, s.https_port
+        "daemon {} (lazy-cow-tree {}) · postgres 127.0.0.1:{} · redis 127.0.0.1:{} · https :{}",
+        s.pid, s.version, s.pg_port, s.redis_port, s.https_port
     );
     if let Some((free, total)) = s.pg_disk {
         println!(
@@ -419,6 +468,7 @@ async fn main() -> Result<()> {
             project,
             path,
             saved,
+            replace,
         } => {
             worktree::drop_marker();
             let p = if saved {
@@ -426,7 +476,7 @@ async fn main() -> Result<()> {
             } else {
                 Some(project_for(&path, project)?)
             };
-            daemon::serve(cli.global, p).await
+            daemon::serve(cli.global, p, replace).await
         }
         Cmd::DevenvProxy {
             listen,
@@ -440,7 +490,7 @@ async fn main() -> Result<()> {
                 devenv_proxy_socket: Some(control_socket),
                 ..cli.global
             };
-            daemon::serve(global, None).await
+            daemon::serve(global, None, false).await
         }
         Cmd::ShellHook {
             project,
@@ -498,20 +548,38 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Worktree(WorktreeCmd::Procs { path, kill }) => {
+        Cmd::Worktree(WorktreeCmd::Procs {
+            path,
+            kill,
+            kill_idle,
+        }) => {
             let dir = path
                 .canonicalize()
                 .with_context(|| format!("no worktree {}", path.display()))?;
             let keep = worktree::ancestors();
             if kill {
-                worktree::kill_processes_in(&dir, &keep, true).await;
+                worktree::kill_processes_in(&dir, &keep, true, true).await;
+            }
+            if kill_idle {
+                for l in worktree::kill_idle_beams(&dir, &keep, beam::IDLE_AFTER_S) {
+                    let idle = l.activity.map_or(0, |a| a.idle_s);
+                    eprintln!(
+                        "stopped pid {} with command \"{}\": nobody used it for {}",
+                        l.pid,
+                        short_command(&l.command),
+                        human_duration(idle)
+                    );
+                }
+                // Its port programs exit with it.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             let mut out = std::io::stdout().lock();
             for l in worktree::processes_left(&dir, &keep) {
+                let why = l.why().map(|w| format!(" ({w})")).unwrap_or_default();
                 // A closed pipe (`| head`) is no error.
                 if writeln!(
                     out,
-                    "pid {} with command \"{}\" was launched from this worktree and is still running",
+                    "pid {} with command \"{}\" was launched from this worktree and is still running{why}",
                     l.pid,
                     short_command(&l.command)
                 )
@@ -606,16 +674,23 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Cmd::Restart => {
+            client::start(true, None).await?;
+            let s: daemon::Status = client::get("/status").await?;
+            eprintln!("lazy-cow-tree {} daemon {} is up", s.version, s.pid);
+            Ok(())
+        }
         Cmd::Down { eject } => {
+            let pid = client::get::<Value>("/status")
+                .await
+                .ok()
+                .and_then(|s| s["pid"].as_u64());
             let _ = client::post::<Value>("/shutdown", &()).await;
+            // Gone with its ports, so a daemon started right after can bind them.
+            if let Some(pid) = pid {
+                daemon::wait_gone(pid as u32).await;
+            }
             if eject {
-                for _ in 0..100 {
-                    if client::get::<Value>("/status").await.is_err() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 // A durable cluster (LAZY_COW_TREE_POSTGRES_DURABLE) has no RAM disk.
                 if config::pg_dir().exists() {
                     ramdisk::eject(&config::pg_dir())?;
@@ -719,6 +794,13 @@ async fn main() -> Result<()> {
                 .or_else(|| std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from))
                 .unwrap_or(cwd);
             match h {
+                HookCmd::SessionStart => {
+                    let Ok(root) = root_of(&dir) else {
+                        return Ok(());
+                    };
+                    let problem = client::ensure_running(&root).await.err();
+                    print!("{}", agent_notes(problem.map(|e| format!("{e:#}"))));
+                }
                 HookCmd::WorktreeCreate => {
                     let name = v["name"].as_str().context("no name in hook input")?;
                     // `feat/login` stays its branch; anything else becomes a label.

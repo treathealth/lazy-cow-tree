@@ -137,6 +137,23 @@ let
     EOF
     done
   '';
+  # The Erlang the project's nodes run (languages.erlang, else languages.elixir's): the
+  # probe is compiled with it, so each of them can load it.
+  beamErlang =
+    if config.languages.erlang.enable then
+      config.languages.erlang.package
+    else if config.languages.elixir.enable then
+      config.languages.elixir.erlang.package or (lib.findFirst (
+        p: (p.pname or "") == "erlang"
+      ) null (config.languages.elixir.package.buildInputs or [ ]))
+    else
+      null;
+  beamProbe = pkgs.runCommand "lazy-cow-tree-beam-probe" { nativeBuildInputs = [ beamErlang ]; } ''
+    mkdir -p "$out"/ebin
+    # erlc wants the file named after the module, not the store path.
+    cp ${./lazy_cow_tree_probe.erl} lazy_cow_tree_probe.erl
+    erlc +deterministic -o "$out"/ebin lazy_cow_tree_probe.erl
+  '';
   # hiPrio in packages: wins over bin/git of git itself (still there for git-upload-pack etc.).
   gitWrapper = pkgs.writeShellScriptBin "git" (
     builtins.replaceStrings
@@ -960,6 +977,12 @@ in
         example = "../myapp-worktrees";
         description = "Where `lazy-cow-tree worktree new` and Claude Code's WorktreeCreate hook put worktrees, relative to the primary checkout. Outside it (`../<name>`), language servers and indexers of the primary don't see the worktrees' files.";
       };
+      stopIdleNodesAfter = mkOption {
+        type = types.nullOr (types.either types.int types.str);
+        default = null;
+        example = "30m";
+        description = "Stop Erlang/Elixir nodes in worktrees that nobody used for this long (\"30m\", \"2h\", seconds): no clients connected, no interactive shell, idle schedulers (`beamProbe` tells), never one in someone's terminal session; with what runs under them (watchers). For a `mix phx.server` an agent started in the background and forgot. Off by default.";
+      };
       autoRemoveMerged = mkOption {
         type = types.bool;
         default = true;
@@ -1097,15 +1120,37 @@ in
         default = true;
         description = "Give pi (which has no LSP client) each supported language server of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as an MCP server `lsp-<name>` in the project's `.pi/mcp.json` (read once the project is trusted): mcp-language-server on the server's wrapper, so it runs behind `lazy-cow-tree lsp` too. Add your own pi servers through `files.\".pi/mcp.json\".json.mcpServers`.";
       };
-      claude.lsp = mkOption {
-        type = types.bool;
-        default = true;
-        description = "Give Claude Code the supported language servers of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as plugin `lazy-cow-tree-lsp`, from a local marketplace set up in `.claude/settings.local.json`, each behind `lazy-cow-tree lsp`.";
+      beamProbe = {
+        enable = mkOption {
+          type = types.bool;
+          default = beamErlang != null;
+          defaultText = lib.literalExpression "languages.erlang.enable || languages.elixir.enable";
+          description = "Load a probe (`-s lazy_cow_tree_probe` in ERL_AFLAGS) into every Erlang/Elixir node started from the devenv shell or as a service: it tells how busy the node is (clients connected, an interactive shell, scheduler use), so `git worktree remove` stops the nodes nobody used for a minute instead of refusing. Compiled with the project's Erlang. A project setting ERL_AFLAGS itself adds `lazyCowTree.beamProbe.flags` to it.";
+        };
+        flags = mkOption {
+          type = types.str;
+          readOnly = true;
+          default = "-pa ${beamProbe}/ebin -s lazy_cow_tree_probe";
+          defaultText = lib.literalExpression ''"-pa <probe>/ebin -s lazy_cow_tree_probe"'';
+          description = "The ERL_AFLAGS that load the probe.";
+        };
       };
-      claude.trustCa = mkOption {
-        type = types.bool;
-        default = true;
-        description = "Set NODE_EXTRA_CA_CERTS in `.claude/settings.local.json` to `<home>/ca/ca-bundle.pem` (the public roots plus the local CA, kept by the daemon), so Claude Code reaches MCP servers on https://*.localhost and its own API. Node reads one file only: to trust other CAs too, set `files.\".claude/settings.local.json\".json.env.NODE_EXTRA_CA_CERTS` to a bundle yourself.";
+      claude = {
+        lsp = mkOption {
+          type = types.bool;
+          default = true;
+          description = "Give Claude Code the supported language servers of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as plugin `lazy-cow-tree-lsp`, from a local marketplace set up in `.claude/settings.local.json`, each behind `lazy-cow-tree lsp`.";
+        };
+        sessionStart = mkOption {
+          type = types.bool;
+          default = true;
+          description = "A SessionStart hook in `.claude/settings.local.json` (`lazy-cow-tree hook session-start`): starts the daemon, or replaces one older than this lazy-cow-tree (it hands its ports over; databases and worktrees stay), and tells the agent how to check on lazy-cow-tree and to run `lazy-cow-tree restart` itself when a URL refuses connections.";
+        };
+        trustCa = mkOption {
+          type = types.bool;
+          default = true;
+          description = "Set NODE_EXTRA_CA_CERTS in `.claude/settings.local.json` to `<home>/ca/ca-bundle.pem` (the public roots plus the local CA, kept by the daemon), so Claude Code reaches MCP servers on https://*.localhost and its own API. Node reads one file only: to trust other CAs too, set `files.\".claude/settings.local.json\".json.env.NODE_EXTRA_CA_CERTS` to a bundle yourself.";
+        };
       };
     };
   };
@@ -1190,6 +1235,8 @@ in
     ++ lib.mapAttrsToList (_: s: lib.hiPrio (lspWrapper s.cmd)) lspServers;
 
     env = {
+      # Before the node's own `-s`/`-eval` (mix's never returns), unlike ERL_FLAGS.
+      ERL_AFLAGS = lib.mkIf cfg.beamProbe.enable (lib.mkDefault cfg.beamProbe.flags);
       LAZY_COW_TREE_PORT = toString cfg.port;
       LAZY_COW_TREE_SERVICES = builtins.toJSON cfg.services;
       LAZY_COW_TREE_NO_AUTO_REMOVE = lib.boolToString (!cfg.autoRemoveMerged);
@@ -1210,6 +1257,9 @@ in
       LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH = pgCfg.copyOnWrite.refresh;
       LAZY_COW_TREE_REDIS_INSTANCE = redisCfg.instance;
       LAZY_COW_TREE_REDIS_START = redisCfg.start.on;
+    }
+    // lib.optionalAttrs (cfg.stopIdleNodesAfter != null) {
+      LAZY_COW_TREE_STOP_IDLE_NODES_AFTER = toString (seconds cfg.stopIdleNodesAfter);
     }
     // lib.optionalAttrs (cfg.testSlots.count != null) {
       LAZY_COW_TREE_TEST_SLOTS = toString cfg.testSlots.count;
@@ -1340,6 +1390,18 @@ in
         };
 
         hooks = {
+          SessionStart = lib.mkIf cfg.claude.sessionStart [
+            {
+              hooks = [
+                {
+                  type = "command";
+                  command = "${exe} hook session-start";
+                  # Replacing an older daemon waits for it to stop its services.
+                  timeout = 180;
+                }
+              ];
+            }
+          ];
           PreToolUse = lib.mkIf cfg.protectPrimary.enable [
             {
               matcher = "Edit|MultiEdit|Write|NotebookEdit";

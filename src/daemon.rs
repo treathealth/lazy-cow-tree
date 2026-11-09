@@ -77,6 +77,8 @@ pub struct Daemon {
     trusted: Arc<Trusted>,
     projects: Mutex<BTreeMap<PathBuf, Arc<ProjectRt>>>,
     shutdown: Notify,
+    /// Where a newer daemon waits for this one's listening sockets (`/handoff`).
+    handoff: Mutex<Option<PathBuf>>,
     /// Checkouts (by project root) whose `start = "up"` services to start, drained
     /// every second.
     up_queue: Mutex<Vec<(PathBuf, Checkout)>>,
@@ -334,6 +336,11 @@ pub struct Status {
     /// (free, total) bytes on the databases' disk (the RAM disk).
     #[serde(default)]
     pub pg_disk: Option<(u64, u64)>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct HandoffReq {
+    pub socket: PathBuf,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -632,50 +639,53 @@ fn redis_key(project: &Project, c: &Checkout) -> String {
 }
 
 async fn daemon_alive() -> bool {
-    running_version().await.is_some()
+    running().await.is_some()
 }
 
-/// The running daemon's version ("" before 0.4.1), None when none runs.
-async fn running_version() -> Option<String> {
+/// The running daemon's version ("" before 0.4.1) and pid, None when none runs.
+async fn running() -> Option<(String, u32)> {
     let status = crate::client::get::<serde_json::Value>("/status")
         .await
         .ok()?;
-    Some(status["version"].as_str().unwrap_or_default().to_string())
+    Some((
+        status["version"].as_str().unwrap_or_default().to_string(),
+        status["pid"].as_u64().unwrap_or_default() as u32,
+    ))
 }
 
 /// `version` (`major.minor.patch`, "" for unknown) is older than `than`.
-fn older(version: &str, than: &str) -> bool {
+pub fn older(version: &str, than: &str) -> bool {
     let parse = |v: &str| -> Vec<u64> { v.split('.').map(|n| n.parse().unwrap_or(0)).collect() };
     parse(version) < parse(than)
 }
 
 /// `lazy-cow-tree serve`: become the daemon, or register with the running one and take
-/// over when it goes away.
-pub async fn serve(global: Global, project: Option<Project>) -> Result<()> {
+/// over when it goes away. A running daemon older than this one (any, with `replace`)
+/// hands over to it.
+pub async fn serve(global: Global, project: Option<Project>, mut replace: bool) -> Result<()> {
     std::fs::create_dir_all(config::home())?;
     let mut registered = false;
     loop {
-        if let Some(running) = running_version().await
-            && older(&running, env!("CARGO_PKG_VERSION"))
+        if let Some((running, pid)) = running().await
+            && (replace || older(&running, env!("CARGO_PKG_VERSION")))
         {
             // Projects of other repositories may run an older lazy-cow-tree: the newest
             // serves all of them (they're saved, and come back with it), so features of
             // a newer one don't silently go missing.
             info!(
-                "taking over from the lazy-cow-tree {} daemon",
+                "taking over from the lazy-cow-tree {} daemon {pid}",
                 if running.is_empty() {
                     "older"
                 } else {
                     &running
                 }
             );
-            let _ = crate::client::post::<serde_json::Value>("/shutdown", &()).await;
-            for _ in 0..300 {
-                if !daemon_alive().await {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut fds = take_over(pid).await;
+            if let Some(control) = crate::handoff::take(&mut fds, "control") {
+                let control = std::os::unix::net::UnixListener::from(control);
+                return lead(global, project, control, fds).await;
             }
+            replace = false;
             registered = false;
         }
         if daemon_alive().await {
@@ -696,7 +706,7 @@ pub async fn serve(global: Global, project: Option<Project>) -> Result<()> {
         }
         let socket = config::socket_path();
         let _ = std::fs::remove_file(&socket);
-        let listener = match UnixListener::bind(&socket) {
+        let listener = match std::os::unix::net::UnixListener::bind(&socket) {
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 debug!("another daemon is starting ({e}); waiting");
@@ -708,7 +718,72 @@ pub async fn serve(global: Global, project: Option<Project>) -> Result<()> {
                 return Err(e).with_context(|| format!("control socket {}", socket.display()));
             }
         };
-        return lead(global, project, listener).await;
+        return lead(global, project, listener, Vec::new()).await;
+    }
+}
+
+/// Ask the daemon `pid` for its listening sockets (`/handoff`). One that can't hand
+/// over (before 0.4.12) or fails to is stopped instead, and waited for until it is
+/// gone with its ports: the sockets, or none to bind anew.
+async fn take_over(pid: u32) -> crate::handoff::Fds {
+    let path = config::home().join(format!("handoff-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let fds = match tokio::net::UnixListener::bind(&path) {
+        Ok(l) => {
+            let req = HandoffReq {
+                socket: path.clone(),
+            };
+            match crate::client::post::<serde_json::Value>("/handoff", &req).await {
+                Ok(_) => receive_sockets(l).await.unwrap_or_else(|e| {
+                    warn!("daemon {pid} handed over no sockets: {e:#}");
+                    Vec::new()
+                }),
+                Err(e) => {
+                    debug!("daemon {pid} can't hand over ({e:#}); stopping it");
+                    Vec::new()
+                }
+            }
+        }
+        Err(e) => {
+            warn!("handoff socket {}: {e}", path.display());
+            Vec::new()
+        }
+    };
+    let _ = std::fs::remove_file(&path);
+    if fds.is_empty() {
+        // Bounded: a daemon mid-shutdown leaves its control socket unanswered.
+        let shutdown = crate::client::post::<serde_json::Value>("/shutdown", &());
+        let _ = tokio::time::timeout(Duration::from_secs(5), shutdown).await;
+        wait_gone(pid).await;
+    }
+    fds
+}
+
+async fn receive_sockets(l: tokio::net::UnixListener) -> Result<crate::handoff::Fds> {
+    // It stops its services, Redis and PostgreSQL first.
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(120), l.accept())
+        .await
+        .context("none within 120s")??;
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    tokio::task::spawn_blocking(move || crate::handoff::recv(&stream)).await?
+}
+
+/// Wait until the process `pid` is gone, and its ports with it: SIGKILL after 60s
+/// (a daemon stuck shutting down would otherwise keep them forever).
+pub async fn wait_gone(pid: u32) {
+    // SAFETY: signal 0 only checks that the process exists.
+    let alive = || pid != 0 && unsafe { libc::kill(pid as i32, 0) } == 0;
+    for i in 0..650 {
+        if !alive() {
+            return;
+        }
+        if i == 600 {
+            warn!("the old daemon {pid} didn't exit within 60s; killing it");
+            // SAFETY: plain kill(2) of the old daemon.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -721,10 +796,89 @@ async fn shutdown_signal() {
     }
 }
 
+/// A TCP listener on `addr`: the one handed over for its port, else a new one. A
+/// port in use is retried for 10s: a daemon stopped just before may still be exiting.
+async fn listen_tcp(
+    inherited: &mut crate::handoff::Fds,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<std::net::TcpListener> {
+    if let Some(fd) = crate::handoff::take(inherited, &format!("tcp:{}", addr.port())) {
+        return Ok(fd.into());
+    }
+    let mut tries = 0;
+    loop {
+        match std::net::TcpListener::bind(addr) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 50 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            r => return r,
+        }
+    }
+}
+
+/// Why `port` can't be bound, and what to do.
+fn bind_error(e: std::io::Error, what: &str, port: u16, flag: &str) -> anyhow::Error {
+    let hint = if e.kind() == std::io::ErrorKind::AddrInUse {
+        format!(
+            "; see what holds it with `lsof -nP -iTCP:{port} -sTCP:LISTEN`, or pick another port with {flag}"
+        )
+    } else {
+        format!("; pick another port with {flag}")
+    };
+    anyhow!("can't listen on the {what} port {port}: {e}{hint}")
+}
+
+/// Listening sockets: their accept loops stop at shutdown, and copies (dup) go to
+/// the next daemon on a handoff.
+struct Listeners {
+    fds: crate::handoff::Fds,
+    tasks: Vec<JoinHandle<()>>,
+    /// True once the saved projects are registered. Until then a daemon that was
+    /// handed sockets leaves connections in the backlog: it doesn't know their
+    /// checkouts yet, and would refuse them.
+    ready: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Listeners {
+    fn tcp(&mut self, l: std::net::TcpListener) -> Result<tokio::net::TcpListener> {
+        let port = l.local_addr()?.port();
+        self.fds
+            .push((format!("tcp:{port}"), l.try_clone()?.into()));
+        l.set_nonblocking(true)?;
+        Ok(tokio::net::TcpListener::from_std(l)?)
+    }
+
+    fn unix(&mut self, key: &str, l: std::os::unix::net::UnixListener) -> Result<UnixListener> {
+        self.fds.push((key.to_string(), l.try_clone()?.into()));
+        l.set_nonblocking(true)?;
+        Ok(UnixListener::from_std(l)?)
+    }
+
+    /// Accept once ready.
+    fn spawn(&mut self, f: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut ready = self.ready.clone();
+        self.tasks.push(tokio::spawn(async move {
+            let _ = ready.wait_for(|r| *r).await;
+            f.await
+        }));
+    }
+
+    /// Accept right away.
+    fn spawn_now(&mut self, f: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.tasks.push(tokio::spawn(f));
+    }
+}
+
 /// The HTTPS proxy and, when on, devenv's control socket. Requests before the
 /// daemon exists get plain 404s.
-fn start_proxy(
+#[allow(clippy::too_many_arguments)]
+async fn start_proxy(
     global: &Global,
+    listeners: &mut Listeners,
+    inherited: &mut crate::handoff::Fds,
+    https: tokio::net::TcpListener,
+    http: Option<tokio::net::TcpListener>,
     routes: Routes,
     ca: Arc<Ca>,
     trusted: Arc<Trusted>,
@@ -746,51 +900,111 @@ fn start_proxy(
             })
         })
     };
-    let (https, http) = (global.https_port, global.http_port);
     let reserved: crate::devenv_proxy::Reserved = {
         let routes = routes.clone();
         Arc::new(move |host| routes.serves(host))
     };
     let devenv = crate::devenv_proxy::DevenvRoutes::new(
         reserved,
-        Some(std::net::SocketAddr::from(([127, 0, 0, 1], https))),
+        Some(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            global.https_port,
+        ))),
         global.devenv_proxy_ca,
     );
     // devenv checks its proxy through plain HTTP; without it `devenv up` starts its own.
     let devenv_socket = match global.devenv_proxy_socket.as_deref() {
         Some(p) if p.as_os_str() == "off" => None,
         Some(p) => Some(p.to_path_buf()),
-        None if http != 0 => Some(crate::devenv_proxy::default_control_socket()),
+        None if global.http_port != 0 => Some(crate::devenv_proxy::default_control_socket()),
         None => None,
     };
     if let Some(socket) = devenv_socket {
-        let devenv = devenv.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::devenv_proxy::serve(&socket, devenv).await {
-                warn!("devenv projects keep their own proxy: {e:#}");
+        let bound = match crate::handoff::take(inherited, "devenv") {
+            Some(fd) => Ok(std::os::unix::net::UnixListener::from(fd)),
+            None => crate::devenv_proxy::bind(&socket)
+                .await
+                .and_then(|l| Ok(l.into_std()?)),
+        };
+        match bound.and_then(|l| listeners.unix("devenv", l)) {
+            Ok(l) => {
+                let devenv = devenv.clone();
+                listeners.spawn(async move {
+                    if let Err(e) = crate::devenv_proxy::serve(&socket, Some(l), devenv).await {
+                        warn!("devenv proxy control socket: {e:#}");
+                    }
+                });
             }
-        });
+            Err(e) => warn!("devenv projects keep their own proxy: {e:#}"),
+        }
     }
-    tokio::spawn(async move {
+    listeners.spawn(async move {
         if let Err(e) = proxy::serve(https, http, routes, devenv, ca, trusted, dash, ensure).await {
             error!("HTTPS proxy: {e:#}");
         }
     });
 }
 
-async fn lead(global: Global, project: Option<Project>, listener: UnixListener) -> Result<()> {
+async fn lead(
+    global: Global,
+    project: Option<Project>,
+    control: std::os::unix::net::UnixListener,
+    mut inherited: crate::handoff::Fds,
+) -> Result<()> {
     info!(
-        "lazy-cow-tree daemon {} (state in {})",
+        "lazy-cow-tree daemon {} {} (state in {})",
+        env!("CARGO_PKG_VERSION"),
         std::process::id(),
         config::home().display()
     );
+    // Every port before anything else: a daemon without them only looks alive.
+    let (ready, ready_rx) = tokio::sync::watch::channel(inherited.is_empty());
+    let mut listeners = Listeners {
+        fds: Vec::new(),
+        tasks: Vec::new(),
+        ready: ready_rx,
+    };
+    let control = listeners.unix("control", control)?;
+    let https = listen_tcp(&mut inherited, proxy::addr(global.https_port))
+        .await
+        .map_err(|e| bind_error(e, "HTTPS", global.https_port, "--https-port"))?;
+    let https = listeners.tcp(https)?;
+    let http = match global.http_port {
+        0 => None,
+        port => match listen_tcp(&mut inherited, proxy::addr(port)).await {
+            Ok(l) => Some(listeners.tcp(l)?),
+            Err(e) => {
+                warn!("HTTP redirect on port {port} disabled: {e}");
+                None
+            }
+        },
+    };
+    let pg_listener = listen_tcp(&mut inherited, ([127, 0, 0, 1], global.pg_port).into())
+        .await
+        .map_err(|e| bind_error(e, "PostgreSQL", global.pg_port, "--pg-port"))?;
+    let pg_listener = listeners.tcp(pg_listener)?;
+    let redis_listener = listen_tcp(&mut inherited, ([127, 0, 0, 1], global.redis_port).into())
+        .await
+        .map_err(|e| bind_error(e, "Redis", global.redis_port, "--redis-port"))?;
+    let redis_listener = listeners.tcp(redis_listener)?;
     let ca = Arc::new(Ca::load_or_create(&config::home().join("ca"))?);
     // The HTTPS proxy and devenv's control socket come up before PostgreSQL (a RAM
     // disk and initdb): `devenv up` gives a proxy it starts five seconds.
     let routes = Routes::default();
     let daemon: Arc<std::sync::OnceLock<std::sync::Weak<Daemon>>> = Default::default();
     let trusted = Arc::new(Trusted::default());
-    start_proxy(&global, routes.clone(), ca, trusted.clone(), daemon.clone());
+    start_proxy(
+        &global,
+        &mut listeners,
+        &mut inherited,
+        https,
+        http,
+        routes.clone(),
+        ca,
+        trusted.clone(),
+        daemon.clone(),
+    )
+    .await;
     // The real server: unix socket only, one port above the proxy's.
     let pg = Postgres::start(
         if global.postgres_durable {
@@ -820,6 +1034,7 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         trusted,
         projects: Mutex::new(BTreeMap::new()),
         shutdown: Notify::new(),
+        handoff: Mutex::new(None),
         up_queue: Mutex::new(Vec::new()),
     });
 
@@ -836,6 +1051,18 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         }
     });
 
+    // Probe sockets of Erlang nodes that exited (`crate::beam`): every `mix` run leaves one.
+    let weak = Arc::downgrade(&d);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            if weak.strong_count() == 0 {
+                break;
+            }
+            let _ = tokio::task::spawn_blocking(crate::beam::sweep).await;
+        }
+    });
+
     let weak = Arc::downgrade(&d);
     let resolve: crate::pgproxy::Resolve = Arc::new(move |user, db, client_port| {
         let weak = weak.clone();
@@ -846,15 +1073,14 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
             }
         })
     });
-    let (pg_port, backend) = (global.pg_port, d.pg.socket());
-    tokio::spawn(async move {
-        if let Err(e) = crate::pgproxy::serve(pg_port, backend, resolve).await {
+    let backend = d.pg.socket();
+    listeners.spawn(async move {
+        if let Err(e) = crate::pgproxy::serve(pg_listener, backend, resolve).await {
             error!("PostgreSQL proxy: {e:#}");
         }
     });
 
     let redis = d.redis.clone();
-    let redis_port = global.redis_port;
     let weak = Arc::downgrade(&d);
     let _ = redis.check.set(Arc::new(move |id, client_port| {
         let weak = weak.clone();
@@ -869,8 +1095,8 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
             why
         })
     }));
-    tokio::spawn(async move {
-        if let Err(e) = redis.serve(redis_port).await {
+    listeners.spawn(async move {
+        if let Err(e) = redis.serve(redis_listener).await {
             error!("Redis: {e:#}");
         }
     });
@@ -890,8 +1116,8 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         }
     });
     let app = api(d.clone());
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+    listeners.spawn_now(async move {
+        if let Err(e) = axum::serve(control, app).await {
             error!("control API: {e}");
         }
     });
@@ -912,13 +1138,24 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         }
     }
     d.save();
+    let _ = ready.send(true);
 
     tokio::select! {
         _ = shutdown_signal() => {}
         _ = d.shutdown.notified() => {}
     }
-    info!("shutting down");
-    let _ = std::fs::remove_file(config::socket_path());
+    let handoff = d.handoff.lock().take();
+    // New connections wait in the backlog for the next daemon (a handoff), or are
+    // refused once the sockets close.
+    for t in &listeners.tasks {
+        t.abort();
+    }
+    if handoff.is_some() {
+        info!("shutting down, handing over to the new daemon");
+    } else {
+        info!("shutting down");
+        let _ = std::fs::remove_file(config::socket_path());
+    }
     let rts: Vec<_> = std::mem::take(&mut *d.projects.lock())
         .into_values()
         .collect();
@@ -928,6 +1165,18 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     // Let hook deletions go out.
     tokio::time::sleep(Duration::from_millis(500)).await;
     d.pg.stop().await;
+    if let Some(path) = handoff {
+        let sent = std::os::unix::net::UnixStream::connect(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|s| crate::handoff::send(&s, &listeners.fds));
+        match sent {
+            Ok(()) => info!("handed the sockets over"),
+            Err(e) => {
+                error!("handing over to {}: {e:#}", path.display());
+                let _ = std::fs::remove_file(config::socket_path());
+            }
+        }
+    }
     Ok(())
 }
 

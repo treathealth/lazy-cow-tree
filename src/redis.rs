@@ -254,10 +254,8 @@ impl Redis {
         }
     }
 
-    pub async fn serve(self: Arc<Self>, port: u16) -> Result<()> {
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .await
-            .with_context(|| format!("binding Redis port {port}"))?;
+    pub async fn serve(self: Arc<Self>, listener: TcpListener) -> Result<()> {
+        let port = listener.local_addr()?.port();
         info!("Redis on 127.0.0.1:{port} (password picks the checkout)");
         loop {
             let (stream, _) = listener.accept().await?;

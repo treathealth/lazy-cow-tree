@@ -6,13 +6,15 @@
 # build caches included. After `worktree add/remove/prune/move` the daemon, if
 # running, provisions or cleans up (`lazy-cow-tree reconcile`). `worktree remove` refuses
 # while the branch has an open pull request on a GitHub origin (gh) or something started
-# in the worktree still runs (`lazy-cow-tree worktree procs`). Every other command
+# in the worktree still runs (`lazy-cow-tree worktree procs`; Erlang/Elixir nodes nobody
+# uses are stopped instead). Every other command
 # is the real git. Adapted from git-cow's wrapper.
 #
 #   LAZY_COW_TREE_GIT_DISABLE=1  plain git
 #   FORCE_ALLOW_OPEN_PR=1        `git worktree remove` even while its branch has an open PR
-#   FORCE_KILL_PROCESSES=1       `git worktree remove` SIGKILLs what still runs in it
-#                                (else it refuses and lists them)
+#   FORCE_KILL_PROCESSES=1       `git worktree remove` SIGKILLs what still runs in it,
+#                                but terminal sessions (else it refuses and lists them;
+#                                as it does for a worktree whose PR merged)
 
 real_git=@git@
 cow=@cow@
@@ -60,13 +62,23 @@ case ${2:-} in
     done
     arg=$target
     [[ -z $target || $target == /* ]] || target=$base/$target
-    if [[ -n $target ]] && ! truthy "${FORCE_ALLOW_OPEN_PR:-}" &&
+    # A merged one whose head is the worktree's HEAD: what still runs there runs merged
+    # code, so it is stopped (but terminal sessions) instead of refusing.
+    merged=
+    if [[ -n $target ]] &&
       branch=$("$real_git" -C "$target" symbolic-ref -q --short HEAD 2>/dev/null) &&
       [[ $("$real_git" -C "$target" remote get-url origin 2>/dev/null) == *github* ]]; then
       # gh failing (not logged in, offline): removed as usual.
-      if prs=$(cd "$target" && "$gh" pr list --head "$branch" --state open \
-        --json url --jq '.[].url' 2>/dev/null) && [[ -n $prs ]]; then
-        echo "error: worktree not removed: branch '$branch' has an open pull request (${prs//$'\n'/, }); merge or close it first, or set FORCE_ALLOW_OPEN_PR=1" >&2
+      head=$("$real_git" -C "$target" rev-parse HEAD 2>/dev/null)
+      open=()
+      while read -r state oid url; do
+        [[ $state == OPEN ]] && open+=("$url")
+        [[ $state == MERGED && $oid == "$head" && -z $merged ]] && merged=$url
+      done < <(cd "$target" && "$gh" pr list --head "$branch" --state all \
+        --json state,headRefOid,url --jq '.[] | "\(.state) \(.headRefOid) \(.url)"' 2>/dev/null)
+      if ((${#open[@]})) && ! truthy "${FORCE_ALLOW_OPEN_PR:-}"; then
+        printf -v prs '%s, ' "${open[@]}"
+        echo "error: worktree not removed: branch '$branch' has an open pull request (${prs%, }); merge or close it first, or set FORCE_ALLOW_OPEN_PR=1" >&2
         exit 1
       fi
     fi
@@ -96,9 +108,17 @@ case ${2:-} in
       ((${#matches[@]} == 1)) && wt=${matches[0]}
     fi
     if [[ -n $wt && -d $wt ]]; then
-      if truthy "${FORCE_KILL_PROCESSES:-}"; then
-        RUST_LOG=lazy_cow_tree=warn "$lazy_cow_tree" worktree procs --kill "$wt" | while IFS= read -r l; do echo "warning: $l" >&2; done
-      elif procs=$("$lazy_cow_tree" worktree procs "$wt" 2>/dev/null) && [[ -n $procs ]]; then
+      if truthy "${FORCE_KILL_PROCESSES:-}" || [[ -n $merged ]]; then
+        # Someone's terminal session survives it: theirs to end.
+        if procs=$(RUST_LOG=lazy_cow_tree=warn "$lazy_cow_tree" worktree procs --kill "$wt") && [[ -n $procs ]]; then
+          while IFS= read -r l; do echo "warning: $l" >&2; done <<<"$procs"
+          echo "error: worktree not removed: close those, or kill them too with: lazy-cow-tree worktree rm --force $wt" >&2
+          exit 1
+        fi
+      # Erlang/Elixir nodes nobody uses (a forgotten `iex -S mix phx.server`) are
+      # stopped; ones with clients, a shell or work going on are kept, saying why.
+      elif procs=$(RUST_LOG=lazy_cow_tree=warn "$lazy_cow_tree" worktree procs --kill-idle "$wt" \
+        2> >(while IFS= read -r l; do echo "note: $l" >&2; done)) && [[ -n $procs ]]; then
         while IFS= read -r l; do echo "warning: $l" >&2; done <<<"$procs"
         printf -v again ' %q' "${globals[@]}" "$@"
         echo "error: worktree not removed: stop them, or kill them with: FORCE_KILL_PROCESSES=1 git$again" >&2
