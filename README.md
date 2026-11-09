@@ -60,8 +60,8 @@ get the environment of the worktree they're in.
 
 Removing a worktree SIGKILLs everything running in it (each service's process group,
 plus any process whose working directory or executable is inside it or that a shell in
-it started, even one that detached or `cd`'d away since, such as a tmux server or an
-agent session started there, with all descendants: the BEAM, esbuild, tailwind, node, …;
+it started, even one that detached or `cd`'d away since, such as a background server an
+agent started there, with all descendants: the BEAM, esbuild, tailwind, node, …;
 never the process asking for the
 removal or its ancestors, such as the Claude Code session), stops its redis-server, drops
 its databases and role, deletes its branch (even `--force` keeps one with commits
@@ -70,6 +70,12 @@ that aren't on the base branch, pushed, or in its merged PR, renamed to
 for background deletion. Gitignored files it deletes that are neither build caches
 (including whatever it carried in or `.worktreeinclude` names), copies of the
 primary checkout's, nor unchanged since setup finished are printed as warnings.
+
+Someone's terminal session there is never killed without `--force`: a process with a
+controlling terminal (an `iex`, a dev server in a terminal tab, an interactive agent,
+tmux's panes) and its parents in the worktree (the shell, the tmux server). The removal
+refuses instead, naming them. Agents' tool shells run in a session of their own, without a
+terminal, so what they start isn't one.
 
 ## Install
 
@@ -137,7 +143,7 @@ checkout: each process gets its own port and `https://[<worktree>.]<hostname>`, 
 and Redis come from the daemon, and devenv doesn't start its own copies (nor its proxy:
 lazy-cow-tree serves the hostnames). It also adds lazy-cow-tree to the shell, runs `lazy-cow-tree
 serve` as a devenv process, exports the checkout's environment in `enterShell`, and wires
-Claude Code's worktree hooks and its trust in the local CA.
+Claude Code's worktree and SessionStart hooks and its trust in the local CA.
 
 ```nix
 # devenv.nix
@@ -243,8 +249,8 @@ devenv doesn't know about.
 registers the project with the one already running: one daemon serves every
 project, and another project's `devenv up` takes over if it stops. Projects of
 different repositories may pin different lazy-cow-tree versions: the newest one's
-`devenv up` shuts an older daemon down cleanly and serves every project itself (the
-RAM disk and databases stay), so a newer version's features are never missing. Each
+`devenv up` replaces an older daemon and serves every project itself (the RAM disk and
+databases stay), so a newer version's features are never missing. Each
 project uses its own GitHub token (the module passes `gh auth token`), whichever
 project started the daemon.
 
@@ -259,6 +265,16 @@ settings and tokens from their last `devenv up`, and logs to
 `~/.local/state/lazy-cow-tree/logs/daemon.log`; a later `devenv up` registers with it.
 A project that never ran `devenv up` isn't started for. `LAZY_COW_TREE_NO_AUTOSTART=1`
 turns this off.
+
+**Updating needs no restart.** Those same commands, `devenv up` and Claude Code's
+SessionStart hook replace a daemon older than themselves, in the background. The old
+daemon stops its services, Redis and PostgreSQL, then hands its listening sockets
+(HTTPS, PostgreSQL, Redis, the control socket) to the new one, so the ports never close:
+requests made meanwhile wait (about a second) instead of being refused, and services
+start again on their next request. `lazy-cow-tree restart` does the same on demand, with
+the same version. A daemon from before 0.4.12 can't hand over: it is stopped and waited
+for (killed after 60s), then the new one binds the ports. A daemon that can't bind a
+port exits with the reason instead of running without it.
 
 **4. Trust the local CA** once: `lazy-cow-tree trust` (macOS keychain, asks for your
 password), for `https://*.localhost`. Node ignores the keychain, so the module also
@@ -376,6 +392,7 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | `lazyCowTree.server` | none | shorthand for `lazyCowTree.services.web.exec` |
 | `lazyCowTree.worktreesDir` | `.claude/worktrees` | where new worktrees go, relative to the primary; `../myapp-worktrees` keeps them out of the primary's language servers and indexers |
 | `lazyCowTree.autoRemoveMerged` | `true` | remove worktrees whose GitHub PR merged (see GitHub above) |
+| `lazyCowTree.stopIdleNodesAfter` | `null` | e.g. `"30m"`: the daemon stops Erlang/Elixir nodes in worktrees nobody used that long (no clients, no shell, idle schedulers: `beamProbe`; never a terminal session's), with their watchers. For a `mix phx.server` an agent started and forgot |
 | `lazyCowTree.httpsPort` | `null` | HTTPS proxy port; unset: 443 where unprivileged processes may bind it, else 8443 |
 | `lazyCowTree.httpPort` | `null` | HTTP port redirecting to HTTPS, 0 disables; unset: 80 where unprivileged processes may bind it, else off |
 | `lazyCowTree.package` | built with lazy-cow-tree's pinned nixpkgs | lazy-cow-tree build; the default is on lazy-cow-tree.cachix.org |
@@ -388,7 +405,9 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | `lazyCowTree.gh.package` | `pkgs.gh` | the real gh the wrappers run |
 | `lazyCowTree.testSlots.count` | `null` | test suites running at once across every checkout; null: a quarter of the CPUs, at least 2; 0: off (see below) |
 | `lazyCowTree.testSlots.commands` | the enabled `languages.*`' test commands | `mix test`, `cargo test`, `pytest`, `npm test`, `npm run test*`, `bun test`, `npx vitest`, …: a program and the leading arguments (globs) that make it a test run |
+| `lazyCowTree.beamProbe.enable` | with `languages.erlang` or `languages.elixir` | a probe in every Erlang/Elixir node (`ERL_AFLAGS`) telling how busy it is: `git worktree remove` stops the idle ones |
 | `lazyCowTree.claude.lsp` | `true` | the language servers as Claude Code plugin `lazy-cow-tree-lsp` from a local marketplace in `.claude/settings.local.json` (step 8) |
+| `lazyCowTree.claude.sessionStart` | `true` | a SessionStart hook: starts the daemon or replaces an older one, and tells the agent how to check on lazy-cow-tree and to run `lazy-cow-tree restart` itself (never `down --eject`) when a URL refuses connections |
 | `lazyCowTree.codex.lsp` | `true` | each supported language server as Codex MCP server `lsp-<binary>` (mcp-language-server) in `.codex/config.toml` (step 8) |
 | `lazyCowTree.codex.mcpLanguageServer` | `pkgs.mcp-language-server` | the LSP-to-MCP bridge (Codex and pi) |
 | `lazyCowTree.pi.lsp` | `true` | each supported language server as pi MCP server `lsp-<binary>` in `.pi/mcp.json` (step 8) |
@@ -560,8 +579,19 @@ removes it too. `FORCE_ALLOW_OPEN_PR=1` skips the check. It also refuses while s
 started in the worktree still runs, other than what lazy-cow-tree runs (its services, which the daemon stops; language
 servers of `lazy-cow-tree lsp`),
 listing each (`pid 123 with command "npm exec vitest" was launched from this worktree
-and is still running`); `FORCE_KILL_PROCESSES=1` SIGKILLs them, with their descendants,
-and removes it. "Started in it": its working directory or executable is inside it, or
+and is still running`); `FORCE_KILL_PROCESSES=1` SIGKILLs them, with their descendants
+(but terminal sessions, see above), and removes it. So does a worktree whose branch's PR
+merged with the worktree's HEAD as its head (merged on GitHub, then `git worktree remove`):
+what runs there runs merged code. `gh pr merge` through the module's `gh` removes it
+that way too. Erlang/Elixir nodes nobody uses are stopped instead of refusing (`note:
+stopped pid 123 …: nobody used it for 12 min`): no connection to their listening ports,
+no interactive shell on a terminal, under 2% of their schedulers busy for a minute. The
+ones still in use are listed with why (`(busy: a client connected)`). Every node started
+from the devenv shell or as a service tells, through a probe the module loads
+(`lazyCowTree.beamProbe.enable`: `-s lazy_cow_tree_probe` in `ERL_AFLAGS`, compiled with
+the project's Erlang) that answers on `<state>/beam/<os pid>.sock`; no node name, cookie
+or EPMD. A project that sets `ERL_AFLAGS` itself adds `${config.lazyCowTree.beamProbe.flags}`
+to it. "Started in it": its working directory or executable is inside it, or
 it inherited the marker the shell hook keeps open in every shell inside a worktree
 (`WORKTREE_PROCESS_MARKER`, an fd on the worktree's git admin dir, kept across `setsid`, `cd /` and double
 forks; on Linux also `DEVENV_ROOT` in its environment). node, bun, python and erlang
@@ -572,7 +602,8 @@ nix's `sh` and `env` for `/bin/sh` and `/usr/bin/env` (also as a script's `#!`),
 SIP would make drop it; the shell hook restores it after SIP's bash and zsh.
 Best effort: hardened-runtime binaries that don't allow `DYLD_*` (most notarized
 apps) ignore it, and daemons that close every fd lose the marker.
-`lazy-cow-tree worktree procs <path> [--kill]` lists (kills) them by hand.
+`lazy-cow-tree worktree procs <path> [--kill | --kill-idle]` lists (kills, kills the idle
+nodes) them by hand.
 
 `gh` is the module's wrapper too (`lazyCowTree.gh.enable`): when `gh pr merge` or
 `gh pr close` (a number, URL, branch, or the current branch's PR) leaves the PR merged
@@ -680,6 +711,7 @@ lazy-cow-tree serve                        # daemon (devenv process)
 lazy-cow-tree worktree new <branch> [--base <ref>]  # feat/login: worktree feat-login; refused if
                                            # another branch's worktree has that name (feat-login)
 lazy-cow-tree worktree rm <name> [--force] # without --force only when nothing would be lost
+                                           # and no terminal session runs there
 lazy-cow-tree worktree list
 lazy-cow-tree service start|stop|restart|log [-s <service>] [<worktree> | . | --primary]
                                            # default and `.`: the checkout you're in; a stopped
@@ -692,7 +724,8 @@ lazy-cow-tree sync                         # pull, merge, remove merged, migrate
 lazy-cow-tree snapshot                     # template := the primary's dev database
 lazy-cow-tree trust                        # trust the local CA (no-op once trusted)
 lazy-cow-tree cert show                    # lazyCowTree.tls.domain's certificate: names, expiry, what it lacks
-lazy-cow-tree down [--eject]               # stop the daemon; --eject drops the RAM disk
+lazy-cow-tree restart                      # new daemon, same ports (requests wait), databases kept
+lazy-cow-tree down [--eject]               # stop the daemon (waits until it exited); --eject drops the RAM disk
 lazy-cow-tree lsp -- <server> [args]
 ```
 ## Ports

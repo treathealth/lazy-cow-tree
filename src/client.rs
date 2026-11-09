@@ -49,14 +49,20 @@ pub async fn request<T: DeserializeOwned>(
 /// or `devenv up` stopping, `worktree rm` and the like would otherwise fail and leave
 /// the worktree, its databases and redis behind. The saved projects come back with it,
 /// with the settings and GH_TOKEN their last `devenv up` registered. A daemon `devenv
-/// up` starts later finds this one running and registers with it.
-/// LAZY_COW_TREE_NO_AUTOSTART=1: fail as before.
+/// up` starts later finds this one running and registers with it. A running daemon
+/// older than this lazy-cow-tree is replaced the same way (it hands its ports over), so
+/// an update needs no restart.
+/// LAZY_COW_TREE_NO_AUTOSTART=1: neither.
 pub async fn ensure_running(root: &Path) -> Result<()> {
     if std::env::var("LAZY_COW_TREE_NO_AUTOSTART").is_ok_and(|v| !v.is_empty() && v != "0") {
         return Ok(());
     }
     if !refused().await {
-        return Ok(());
+        return if outdated().await {
+            start(false, Some(root)).await
+        } else {
+            Ok(())
+        };
     }
     // Only a saved project comes back; anything else needs its `devenv up` (settings).
     if !crate::daemon::registered_projects()
@@ -65,9 +71,40 @@ pub async fn ensure_running(root: &Path) -> Result<()> {
     {
         return Ok(());
     }
+    start(false, Some(root)).await
+}
+
+/// The running daemon is older than this lazy-cow-tree.
+async fn outdated() -> bool {
+    running()
+        .await
+        .is_some_and(|(v, _)| crate::daemon::older(&v, env!("CARGO_PKG_VERSION")))
+}
+
+/// The running daemon's version and pid; None when none answers within 2s (one
+/// handing over answers once the next one is up).
+async fn running() -> Option<(String, u64)> {
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        get::<serde_json::Value>("/status"),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some((
+        status["version"].as_str().unwrap_or_default().to_string(),
+        status["pid"].as_u64().unwrap_or_default(),
+    ))
+}
+
+/// `serve --saved` in the background, under `autostart.lock`: it becomes the daemon,
+/// or takes over from an older one (any, with `replace`). Waits until it serves (and
+/// `root`'s project again, which it re-registers after binding).
+pub async fn start(replace: bool, root: Option<&Path>) -> Result<()> {
     // One starter at a time; the others find it running once they get the lock.
     let home = crate::config::home();
     std::fs::create_dir_all(home.join("logs"))?;
+    let old = running().await;
     let lock = std::fs::File::create(home.join("autostart.lock"))?;
     let lock = tokio::task::spawn_blocking(move || {
         use std::os::fd::AsRawFd;
@@ -77,7 +114,14 @@ pub async fn ensure_running(root: &Path) -> Result<()> {
             .ok_or_else(std::io::Error::last_os_error)
     })
     .await??;
-    if !refused().await {
+    // Done by whoever held the lock.
+    let now = running().await;
+    let done = if replace {
+        now.is_some() && now.as_ref().map(|r| r.1) != old.as_ref().map(|r| r.1)
+    } else {
+        now.is_some() && !outdated().await
+    };
+    if done {
         return Ok(());
     }
     let log_path = home.join("logs").join("daemon.log");
@@ -92,7 +136,11 @@ pub async fn ensure_running(root: &Path) -> Result<()> {
         if std::env::var("TMPDIR").is_ok_and(|t| t.starts_with("/tmp/lazy-cow-tree-")) {
             cmd.env_remove("TMPDIR");
         }
-        cmd.args(["serve", "--saved"])
+        cmd.args(["serve", "--saved"]);
+        if replace {
+            cmd.arg("--replace");
+        }
+        cmd
             // Not in a worktree: removing it would take the daemon along.
             .current_dir(&home)
             .stdin(std::process::Stdio::null())
@@ -103,13 +151,27 @@ pub async fn ensure_running(root: &Path) -> Result<()> {
             .spawn()
             .context("starting the daemon")?
     };
-    eprintln!(
-        "the lazy-cow-tree daemon wasn't running; started it (log: {})",
-        log_path.display()
-    );
-    // Up once it serves this project again (it re-registers the saved ones after binding).
-    for _ in 0..300 {
-        if registered(root).await {
+    match &now {
+        None => eprintln!(
+            "the lazy-cow-tree daemon wasn't running; started it (log: {})",
+            log_path.display()
+        ),
+        Some((v, pid)) => eprintln!(
+            "replacing the lazy-cow-tree {v} daemon {pid} with {} (log: {})",
+            env!("CARGO_PKG_VERSION"),
+            log_path.display()
+        ),
+    }
+    // The old daemon stops its services and PostgreSQL before handing over.
+    for _ in 0..1800 {
+        let up = running()
+            .await
+            .is_some_and(|(_, pid)| pid == child.id() as u64);
+        let serves = match root {
+            Some(root) => registered(root).await,
+            None => true,
+        };
+        if up && serves {
             drop(lock);
             return Ok(());
         }
@@ -122,7 +184,7 @@ pub async fn ensure_running(root: &Path) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     bail!(
-        "the daemon didn't come up within 30s; see {}",
+        "the daemon didn't come up within 3 minutes; see {}",
         log_path.display()
     )
 }

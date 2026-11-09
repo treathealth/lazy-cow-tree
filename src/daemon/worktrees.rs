@@ -173,7 +173,8 @@ impl Daemon {
         } else {
             self.check_removable(&rt, &info).await?
         };
-        self.remove_locked(&rt, &info, &req.keep_pids, pr).await
+        self.remove_locked(&rt, &info, &req.keep_pids, pr, req.force)
+            .await
     }
 
     /// Ok(Some(pr)) when a merged PR is what makes it safe.
@@ -273,7 +274,26 @@ impl Daemon {
         info: &worktree::Info,
         keep: &[i32],
         pr: Option<u64>,
+        force: bool,
     ) -> Result<Vec<String>> {
+        // Someone's iex, dev server in a terminal tab or agent session: theirs to end.
+        if !force {
+            let (p, keep) = (info.path.clone(), keep.to_vec());
+            let sessions =
+                tokio::task::spawn_blocking(move || worktree::terminal_sessions_in(&p, &keep))
+                    .await?;
+            if !sessions.is_empty() {
+                let list: Vec<String> = sessions
+                    .iter()
+                    .map(|l| format!("pid {} ({})", l.pid, short_command(&l.command)))
+                    .collect();
+                anyhow::bail!(
+                    "{} not removed: a terminal session runs in it: {}; close it, or pass --force to kill it too",
+                    info.name,
+                    list.join(", ")
+                );
+            }
+        }
         let mut warnings = Vec::new();
         let p = info.path.clone();
         if let Ok(Ok(files)) = tokio::task::spawn_blocking(move || worktree::uncommitted(&p)).await
@@ -305,7 +325,7 @@ impl Daemon {
         let c = rt.project.checkout(Some(&info.name), info.path.clone());
         self.servers.stop_checkout(&c).await;
         // Whatever else runs there: a server started by hand, iex, watchers.
-        worktree::kill_processes_in(&info.path, keep, false).await;
+        worktree::kill_processes_in(&info.path, keep, false, false).await;
         // Decided while the worktree (its HEAD) is still there.
         let delete_branch = pr.is_some() || self.branch_disposable(rt, info).await;
         // Files first: if they can't move, the databases stay with them.
@@ -404,10 +424,22 @@ impl Daemon {
                 "{branch}: #{number} merged; removing worktree {}",
                 info.name
             );
-            if let Err(e) = self.remove_locked(rt, &info, &[], Some(number)).await {
+            if let Err(e) = self
+                .remove_locked(rt, &info, &[], Some(number), false)
+                .await
+            {
                 warn!("removing {}: {e:#}", info.name);
             }
         }
         Ok(())
+    }
+}
+
+/// A command line on one line, at most 80 characters.
+fn short_command(c: &str) -> String {
+    let c = c.replace(['\n', '\r'], " ");
+    match c.char_indices().nth(79) {
+        Some((i, _)) => format!("{}…", &c[..i]),
+        None => c,
     }
 }

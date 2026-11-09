@@ -191,14 +191,14 @@ fn full(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) 
     resp
 }
 
-/// Bind `port`; below 1024 on all interfaces (unprivileged on macOS), else loopback.
-async fn bind(port: u16) -> Result<TcpListener> {
-    let addr: SocketAddr = if port < 1024 {
+/// Where the proxy listens on `port`: below 1024 all interfaces (unprivileged on
+/// macOS), else loopback.
+pub fn addr(port: u16) -> SocketAddr {
+    if port < 1024 {
         ([0, 0, 0, 0], port).into()
     } else {
         ([127, 0, 0, 1], port).into()
-    };
-    Ok(TcpListener::bind(addr).await?)
+    }
 }
 
 /// A devenv route's own certificate (its project's mkcert CA), else a project
@@ -233,8 +233,8 @@ impl ResolvesServerCert for Certificates {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
-    https_port: u16,
-    http_port: u16,
+    https: TcpListener,
+    http: Option<TcpListener>,
     routes: Routes,
     devenv: DevenvRoutes,
     ca: Arc<crate::tls::Ca>,
@@ -255,20 +255,24 @@ pub async fn serve(
         dashboard,
         ensure,
     });
-    let https = bind(https_port).await.map_err(|e| {
-        anyhow::anyhow!("binding HTTPS port {https_port}: {e} (pick another with --https-port)")
-    })?;
+    let https_port = https.local_addr()?.port();
     info!("HTTPS proxy on port {https_port}");
-    if http_port != 0 {
-        match bind(http_port).await {
-            Ok(l) => {
-                tokio::spawn(http_loop(l, https_port, shared.clone()));
+    // In this task, not a spawned one: aborting it (a handoff) stops both.
+    let redirect = {
+        let shared = shared.clone();
+        async move {
+            match http {
+                Some(l) => http_loop(l, https_port, shared).await,
+                None => std::future::pending().await,
             }
-            Err(e) => warn!("HTTP redirect on port {http_port} disabled: {e}"),
         }
-    }
+    };
+    tokio::pin!(redirect);
     loop {
-        let (stream, peer) = https.accept().await?;
+        let (stream, peer) = tokio::select! {
+            r = https.accept() => r?,
+            () = &mut redirect => continue,
+        };
         if !peer.ip().is_loopback() {
             debug!("refusing {peer}");
             continue;

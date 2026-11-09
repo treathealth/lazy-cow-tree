@@ -27,8 +27,8 @@ mod procs;
 pub use self::ports::*;
 
 pub use self::procs::{
-    MARKER, ancestors, drop_marker, fd_open_on, kill_processes_in, marker_path, pid_inside,
-    processes_left, tcp_client_pid,
+    MARKER, ancestors, drop_marker, fd_open_on, kill_idle_beams, kill_processes_in, marker_path,
+    pid_inside, processes_left, tcp_client_pid, terminal_sessions_in,
 };
 
 #[derive(Debug, Clone)]

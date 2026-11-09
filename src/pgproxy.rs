@@ -29,10 +29,8 @@ pub type Resolve = Arc<
     dyn Fn(String, String, u16) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
 >;
 
-pub async fn serve(port: u16, backend: PathBuf, resolve: Resolve) -> Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .with_context(|| format!("binding PostgreSQL port {port}"))?;
+pub async fn serve(listener: TcpListener, backend: PathBuf, resolve: Resolve) -> Result<()> {
+    let port = listener.local_addr()?.port();
     info!("PostgreSQL on 127.0.0.1:{port} (user picks the checkout)");
     loop {
         let (stream, _) = listener.accept().await?;

@@ -121,6 +121,7 @@ fn project_settings_from_env() {
         services: Default::default(),
         no_sync: false,
         no_auto_remove: false,
+        stop_idle_nodes_after: None,
         databases: Vec::new(),
         tls_domain: None,
         tls_github_repository: None,

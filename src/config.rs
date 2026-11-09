@@ -75,6 +75,12 @@ pub struct ProjectSettings {
     /// Don't remove worktrees whose PR merged.
     #[arg(long, env = "LAZY_COW_TREE_NO_AUTO_REMOVE", value_parser = clap::builder::BoolishValueParser::new())]
     pub no_auto_remove: bool,
+    /// Stop Erlang/Elixir nodes in worktrees that nobody used for this many seconds (no
+    /// clients, no shell, idle schedulers: their probe tells; never a terminal
+    /// session's) [default: never].
+    #[arg(long, env = "LAZY_COW_TREE_STOP_IDLE_NODES_AFTER")]
+    #[serde(default)]
+    pub stop_idle_nodes_after: Option<u64>,
     /// More databases every checkout gets, next to its main one (e.g. `cms`: a second
     /// Ecto repo): `<prefix>_<name>_dev`, `_test` and test partitions per checkout,
     /// worktrees' cloned from `<prefix>_<name>_template`, in `<NAME>_DATABASE_URL` and

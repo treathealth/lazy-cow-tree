@@ -134,6 +134,16 @@ pub(super) fn api(d: Arc<Daemon>) -> Router {
             }),
         )
         .route(
+            "/handoff",
+            post(
+                |State(d): State<Arc<Daemon>>, Json(r): Json<super::HandoffReq>| async move {
+                    *d.handoff.lock() = Some(r.socket);
+                    d.shutdown.notify_one();
+                    ApiResult::Ok(Json(serde_json::json!({})))
+                },
+            ),
+        )
+        .route(
             "/shutdown",
             post(|State(d): State<Arc<Daemon>>| async move {
                 d.shutdown.notify_one();

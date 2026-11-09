@@ -81,6 +81,8 @@ pass() { echo "ok - $*"; }
 fail() {
   echo "FAIL - $*" >&2
   sed "s/\x1b\[[0-9;]*m//g" "$work/daemon.log" | tail -25 >&2
+  # A daemon started in the background (autostart, restart).
+  [[ -f $home/logs/daemon.log ]] && { echo "--- $home/logs/daemon.log" >&2; sed "s/\x1b\[[0-9;]*m//g" "$home/logs/daemon.log" | tail -40 >&2; }
   exit 1
 }
 # eventually <seconds> <command...>: retry until it succeeds.
@@ -326,7 +328,8 @@ sed -e "s|@name@|faketest|" -e "s|@lazyCowTree@|$bin|" -e "s|@patterns@|'test'|"
 chmod +x "$home/wrapped/faketest"
 slotted() { PATH="$home/wrapped:$home/real:$PATH" LAZY_COW_TREE_TEST_SLOTS=1 faketest "$@"; }
 slotted test 2>"$work/slot1.err" & a=$!
-sleep 0.3
+# Holding the slot before the others start.
+eventually 10 grep -q '^start test' "$home/runs.log" || fail "first test run didn't start"
 slotted test 2>"$work/slot2.err" & b=$!
 slotted other 2>/dev/null
 wait "$a" "$b"
@@ -476,6 +479,42 @@ eventually 60 test -f "$fresh_marker" || fail "worktree not migrated after the f
 [[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_template'") ]] ||
   fail "template made from a feature branch"
 pass "fresh primary on a feature branch migrated, template left alone"
+
+# `restart` (as a newer lazy-cow-tree replacing an older daemon): the old daemon hands
+# its ports over, so requests made meanwhile wait and are answered, never refused.
+old_pid=$("$bin" status | awk 'NR == 1 { print $2 }')
+wt_f=$work/app/.claude/worktrees/fresh
+db_url=$(env_of "$wt_f" DATABASE_URL)
+redis_url=$(env_of "$wt_f" REDIS_URL)
+hammer() {
+  while [[ ! -e $work/hammer.stop ]]; do
+    psql "$db_url" -tAc 'select 1' >/dev/null 2>&1 || echo "psql" >>"$work/hammer.err"
+    redis-cli --no-auth-warning -u "$redis_url" ping 2>&1 | grep -qx PONG || echo "redis" >>"$work/hammer.err"
+    curl_lf -f -o /dev/null "https://fresh.web.demo.localhost:8443/" 2>>"$work/hammer.curl" || echo "https $(date +%T.%N)" >>"$work/hammer.err"
+    "$bin" status >/dev/null 2>&1 || echo "status" >>"$work/hammer.err"
+    echo >>"$work/hammer.ok"
+  done
+}
+# Started first: its on-demand start is slow on CI runners.
+eventually 120 curl_lf -f -o /dev/null "https://fresh.web.demo.localhost:8443/" || fail "web service not up before the restart"
+hammer &
+hammering=$!
+eventually 120 test -s "$work/hammer.ok" || fail "nothing answered before the restart"
+date +"restart start %T.%N" >>"$work/hammer.err"
+"$bin" restart 2>"$work/restart.log" || fail "restart ($?): $(cat "$work/restart.log" "$work/hammer.err" "$work/hammer.curl")"
+date +"restart end %T.%N" >>"$work/hammer.err"
+before=$(wc -l <"$work/hammer.ok")
+answered() { (($(wc -l <"$work/hammer.ok") > before + 2)); }
+eventually 60 answered || fail "nothing answered after the restart: $(cat "$work/hammer.err" "$work/hammer.curl")"
+touch "$work/hammer.stop"
+wait "$hammering"
+grep -qv '^restart' "$work/hammer.err" && fail "refused during the handoff: $(cat "$work/hammer.err" "$work/hammer.curl")"
+wait "$daemon" 2>/dev/null || true
+daemon=
+kill -0 "$old_pid" 2>/dev/null && fail "the old daemon $old_pid is still running"
+new_pid=$("$bin" status | awk 'NR == 1 { print $2 }')
+[[ $new_pid != "$old_pid" ]] || fail "restart kept daemon $old_pid"
+pass "restart: daemon $old_pid handed its ports to $new_pid, nothing refused ($(wc -l <"$work/hammer.ok") rounds)"
 
 # No daemon (a reboot, `devenv up` stopped): `worktree rm` starts one with the saved
 # projects, then removes the worktree and its databases as usual.

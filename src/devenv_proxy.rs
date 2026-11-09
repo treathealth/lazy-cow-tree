@@ -312,12 +312,16 @@ fn username() -> String {
 }
 
 /// Serve the control socket. Refuses when another proxy (devenv's own) answers on it.
-pub async fn serve(socket: &Path, routes: DevenvRoutes) -> Result<()> {
-    prepare_socket(socket).await?;
-    let listener = UnixListener::bind(socket)
-        .with_context(|| format!("failed to bind proxy control socket {}", socket.display()))?;
-    std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .context("failed to secure proxy control socket")?;
+/// `listener`: the socket a daemon handed over, already bound there.
+pub async fn serve(
+    socket: &Path,
+    listener: Option<UnixListener>,
+    routes: DevenvRoutes,
+) -> Result<()> {
+    let listener = match listener {
+        Some(l) => l,
+        None => bind(socket).await?,
+    };
     info!("devenv proxy control socket on {}", socket.display());
     loop {
         let (stream, _) = listener.accept().await?;
@@ -328,6 +332,16 @@ pub async fn serve(socket: &Path, routes: DevenvRoutes) -> Result<()> {
             }
         });
     }
+}
+
+/// Bind the control socket (its own copy goes with a handoff, `Daemon::handoff_fds`).
+pub async fn bind(socket: &Path) -> Result<UnixListener> {
+    prepare_socket(socket).await?;
+    let listener = UnixListener::bind(socket)
+        .with_context(|| format!("failed to bind proxy control socket {}", socket.display()))?;
+    std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .context("failed to secure proxy control socket")?;
+    Ok(listener)
 }
 
 async fn prepare_socket(socket: &Path) -> Result<()> {

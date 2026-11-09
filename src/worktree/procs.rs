@@ -63,6 +63,9 @@ pub(super) struct Proc {
     pub exe: Vec<u8>,
     /// When it started (pids are reused: checked again before killing).
     pub start: u64,
+    /// It has a controlling terminal: part of someone's terminal session. Agents' tool
+    /// shells run in a session of their own, without one.
+    pub tty: bool,
 }
 
 /// Every process.
@@ -111,6 +114,8 @@ pub(super) fn process(pid: i32) -> Option<Proc> {
         cwd,
         exe: buf,
         start: start_of(&bsd),
+        // NODEV: none.
+        tty: bsd.e_tdev != u32::MAX,
     })
 }
 
@@ -335,7 +340,7 @@ pub(super) fn processes() -> Vec<Proc> {
         .flatten()
         .filter_map(|e| {
             let pid: i32 = e.file_name().to_str()?.parse().ok()?;
-            let (ppid, start) = stat(pid)?;
+            let (ppid, start, tty) = stat(pid)?;
             let link = |n: &str| {
                 std::fs::read_link(e.path().join(n))
                     .map(|p| p.as_os_str().as_bytes().to_vec())
@@ -347,6 +352,7 @@ pub(super) fn processes() -> Vec<Proc> {
                 cwd: link("cwd"),
                 exe: link("exe"),
                 start,
+                tty,
             })
         })
         .collect()
@@ -355,7 +361,7 @@ pub(super) fn processes() -> Vec<Proc> {
 /// One process.
 #[cfg(not(target_os = "macos"))]
 pub(super) fn process(pid: i32) -> Option<Proc> {
-    let (ppid, start) = stat(pid)?;
+    let (ppid, start, tty) = stat(pid)?;
     let link = |n: &str| {
         std::fs::read_link(format!("/proc/{pid}/{n}"))
             .map(|p| p.as_os_str().as_bytes().to_vec())
@@ -367,6 +373,7 @@ pub(super) fn process(pid: i32) -> Option<Proc> {
         cwd: link("cwd"),
         exe: link("exe"),
         start,
+        tty,
     })
 }
 
@@ -398,18 +405,23 @@ pub fn tcp_client_pid(client_port: u16, server_port: u16) -> Option<i32> {
     })
 }
 
-/// (parent pid, start time) from /proc/<pid>/stat: pid (comm) state ppid ... starttime (22nd).
+/// (parent pid, start time, controlling terminal) from /proc/<pid>/stat: pid (comm)
+/// state ppid pgrp session tty_nr ... starttime (22nd).
 #[cfg(not(target_os = "macos"))]
-fn stat(pid: i32) -> Option<(i32, u64)> {
+fn stat(pid: i32) -> Option<(i32, u64, bool)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-    Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+    Some((
+        fields.get(1)?.parse().ok()?,
+        fields.get(19)?.parse().ok()?,
+        fields.get(4)? != &"0",
+    ))
 }
 
 /// When `pid` started, if it runs.
 #[cfg(not(target_os = "macos"))]
 pub(super) fn start_time(pid: i32) -> Option<u64> {
-    stat(pid).map(|(_, start)| start)
+    stat(pid).map(|(_, start, _)| start)
 }
 
 /// Paths of the files `pid` holds open on fds a marker can be on.
@@ -479,12 +491,22 @@ pub fn pid_inside(pid: i32, dirs: &[PathBuf]) -> Option<(usize, String)> {
     Some((i, cmd))
 }
 
+/// A process running in a worktree (`processes_in`).
+pub(super) struct Hit {
+    pub pid: i32,
+    pub start: u64,
+    pub exe: Vec<u8>,
+    /// Part of someone's terminal session (`terminal_sessions`).
+    pub terminal: bool,
+    /// Its ancestors among the hits.
+    pub under: Vec<i32>,
+}
+
 /// Processes running in `dir` (`runs_inside`: the BEAM, esbuild, tailwind, node, what a
-/// shell there started and detached, ...) and all their descendants, as (pid, start
-/// time, executable), except `keep`, this process and their ancestors, and with
-/// `spare_ours` what lazy-cow-tree runs (the daemon's services, which it stops itself;
-/// `lazy-cow-tree lsp`'s language servers).
-pub(super) fn processes_in(dir: &Path, keep: &[i32], spare_ours: bool) -> Vec<(i32, u64, Vec<u8>)> {
+/// shell there started and detached, ...) and all their descendants, except `keep`,
+/// this process and their ancestors, and with `spare_ours` what lazy-cow-tree runs (the
+/// daemon's services, which it stops itself; `lazy-cow-tree lsp`'s language servers).
+pub(super) fn processes_in(dir: &Path, keep: &[i32], spare_ours: bool) -> Vec<Hit> {
     let marker = marker_path(dir).unwrap_or_default();
     let marker = marker.as_os_str().as_bytes();
     let dir = dir.as_os_str().as_bytes();
@@ -497,21 +519,46 @@ pub(super) fn processes_in(dir: &Path, keep: &[i32], spare_ours: bool) -> Vec<(i
     let mut roots = keep.to_vec();
     roots.push(me);
     let mut hit = sweep(&procs, &roots);
+    let parent: HashMap<i32, i32> = procs.iter().map(|(p, pp, _)| (*p, *pp)).collect();
     if spare_ours {
         let ours: Vec<i32> = all
             .iter()
             .filter(|p| is_ours(&p.exe))
             .map(|p| p.pid)
             .collect();
-        let parent: HashMap<i32, i32> = procs.iter().map(|(p, pp, _)| (*p, *pp)).collect();
         hit.retain(|&p| {
             let line = with_ancestors(&parent, &[p]);
             !ours.iter().any(|o| line.contains(o))
         });
     }
     let by_pid: HashMap<i32, &Proc> = all.iter().map(|p| (p.pid, p)).collect();
-    hit.into_iter()
-        .map(|p| (p, by_pid[&p].start, by_pid[&p].exe.clone()))
+    let terminal = terminal_sessions(&hit, &parent, |p| by_pid[&p].tty);
+    hit.iter()
+        .map(|&p| Hit {
+            pid: p,
+            start: by_pid[&p].start,
+            exe: by_pid[&p].exe.clone(),
+            terminal: terminal.contains(&p),
+            under: with_ancestors(&parent, &[p])
+                .into_iter()
+                .filter(|&a| a != p && hit.contains(&a))
+                .collect(),
+        })
+        .collect()
+}
+
+/// Of `hit`, someone's terminal session: what has a controlling terminal (an iex, a
+/// dev server in a terminal tab, an interactive agent, tmux's panes) and its parents
+/// there (the shell, the tmux server). Never killed without `--force`.
+pub(super) fn terminal_sessions(
+    hit: &[i32],
+    parent: &HashMap<i32, i32>,
+    tty: impl Fn(i32) -> bool,
+) -> HashSet<i32> {
+    let ttys: Vec<i32> = hit.iter().copied().filter(|&p| tty(p)).collect();
+    with_ancestors(parent, &ttys)
+        .into_iter()
+        .filter(|p| hit.contains(p))
         .collect()
 }
 
@@ -575,37 +622,109 @@ pub(super) fn with_ancestors(parent: &HashMap<i32, i32>, pids: &[i32]) -> HashSe
 pub struct Left {
     pub pid: i32,
     pub command: String,
+    /// A BEAM's, from its probe (`crate::beam`).
+    pub activity: Option<crate::beam::Activity>,
+    /// Part of someone's terminal session (`terminal_sessions`).
+    pub terminal: bool,
+}
+
+impl Left {
+    fn of(h: &Hit) -> Self {
+        Left {
+            pid: h.pid,
+            // Exiting or mid-exec: its executable at least.
+            command: command(h.pid).unwrap_or_else(|| String::from_utf8_lossy(&h.exe).into_owned()),
+            activity: crate::beam::activity(h.pid),
+            terminal: h.terminal,
+        }
+    }
+
+    /// Why it still runs: busy, or someone's terminal session.
+    pub fn why(&self) -> Option<String> {
+        if self.terminal {
+            return Some("a terminal session".into());
+        }
+        self.activity
+            .as_ref()
+            .and_then(|a| a.busy(crate::beam::IDLE_AFTER_S))
+            .map(|b| format!("busy: {b}"))
+    }
 }
 
 /// What still runs in `dir`, but `keep`, their ancestors and what lazy-cow-tree runs
-/// (the daemon's services: it stops them itself; language servers).
+/// (the daemon's services: it stops them itself; language servers). What runs under a
+/// BEAM there (erl_child_setup, its port programs) is its part, not listed.
 pub fn processes_left(dir: &Path, keep: &[i32]) -> Vec<Left> {
-    let mut left: Vec<Left> = processes_in(dir, keep, true)
-        .into_iter()
-        .map(|(pid, _, exe)| Left {
-            pid,
-            // Exiting or mid-exec: its executable at least.
-            command: command(pid).unwrap_or_else(|| String::from_utf8_lossy(&exe).into_owned()),
-        })
+    let hits = processes_in(dir, keep, true);
+    let mut left: Vec<Left> = hits.iter().map(Left::of).collect();
+    let beams: Vec<i32> = left
+        .iter()
+        .filter(|l| l.activity.is_some())
+        .map(|l| l.pid)
         .collect();
+    left.retain(|l| {
+        let h = hits.iter().find(|h| h.pid == l.pid);
+        !h.is_some_and(|h| h.under.iter().any(|a| beams.contains(a)))
+    });
     left.sort_by_key(|l| l.pid);
     left
 }
 
+/// The terminal sessions running in `dir` (`terminal_sessions`), but `keep` and their
+/// ancestors.
+pub fn terminal_sessions_in(dir: &Path, keep: &[i32]) -> Vec<Left> {
+    processes_in(dir, keep, false)
+        .iter()
+        .filter(|h| h.terminal)
+        .map(Left::of)
+        .collect()
+}
+
+/// SIGKILL the BEAMs in `dir` nobody used for `idle_after` seconds
+/// (`beam::Activity::busy`: no clients, no shell), with what runs under them there
+/// (erl_child_setup, port programs: esbuild, tailwind); never someone's terminal
+/// session. Returns them.
+pub fn kill_idle_beams(dir: &Path, keep: &[i32], idle_after: u64) -> Vec<Left> {
+    crate::beam::sweep();
+    let hits = processes_in(dir, keep, true);
+    let idle: Vec<Left> = hits
+        .iter()
+        .filter(|h| !h.terminal)
+        .map(Left::of)
+        .filter(|l| {
+            l.activity
+                .as_ref()
+                .is_some_and(|a| a.busy(idle_after).is_none())
+        })
+        .collect();
+    for h in &hits {
+        let under_idle = idle
+            .iter()
+            .any(|i| i.pid == h.pid || h.under.contains(&i.pid));
+        // Not a process that got its pid since.
+        if under_idle && !h.terminal && start_time(h.pid) == Some(h.start) {
+            unsafe { libc::kill(h.pid, libc::SIGKILL) };
+        }
+    }
+    idle
+}
+
 /// SIGKILL everything running in `dir` (dev servers and their watchers) but `keep`,
-/// their ancestors and, with `spare_ours`, what lazy-cow-tree runs: a dev server needs
-/// no graceful shutdown, and left alive they'd write into the deleted worktree.
-pub async fn kill_processes_in(dir: &Path, keep: &[i32], spare_ours: bool) {
+/// their ancestors, with `spare_ours` what lazy-cow-tree runs and with
+/// `spare_terminals` someone's terminal session: a dev server needs no graceful
+/// shutdown, and left alive they'd write into the deleted worktree.
+pub async fn kill_processes_in(dir: &Path, keep: &[i32], spare_ours: bool, spare_terminals: bool) {
     for _ in 0..3 {
-        let pids = processes_in(dir, keep, spare_ours);
-        if pids.is_empty() {
+        let mut hits = processes_in(dir, keep, spare_ours);
+        hits.retain(|h| !(spare_terminals && h.terminal));
+        if hits.is_empty() {
             return;
         }
-        info!("killing {} process(es) in {}", pids.len(), dir.display());
-        for (p, start, _) in &pids {
+        info!("killing {} process(es) in {}", hits.len(), dir.display());
+        for h in &hits {
             // Not a process that got its pid since.
-            if start_time(*p) == Some(*start) {
-                unsafe { libc::kill(*p, libc::SIGKILL) };
+            if start_time(h.pid) == Some(h.start) {
+                unsafe { libc::kill(h.pid, libc::SIGKILL) };
             }
         }
         // Catch anything forked meanwhile.
