@@ -328,7 +328,8 @@ sed -e "s|@name@|faketest|" -e "s|@lazyCowTree@|$bin|" -e "s|@patterns@|'test'|"
 chmod +x "$home/wrapped/faketest"
 slotted() { PATH="$home/wrapped:$home/real:$PATH" LAZY_COW_TREE_TEST_SLOTS=1 faketest "$@"; }
 slotted test 2>"$work/slot1.err" & a=$!
-sleep 0.3
+# Holding the slot before the others start.
+eventually 10 grep -q '^start test' "$home/runs.log" || fail "first test run didn't start"
 slotted test 2>"$work/slot2.err" & b=$!
 slotted other 2>/dev/null
 wait "$a" "$b"
@@ -494,9 +495,11 @@ hammer() {
     echo >>"$work/hammer.ok"
   done
 }
+# Started first: its on-demand start is slow on CI runners.
+eventually 120 curl_lf -f -o /dev/null "https://fresh.web.demo.localhost:8443/" || fail "web service not up before the restart"
 hammer &
 hammering=$!
-eventually 30 test -s "$work/hammer.ok" || fail "nothing answered before the restart"
+eventually 120 test -s "$work/hammer.ok" || fail "nothing answered before the restart"
 date +"restart start %T.%N" >>"$work/hammer.err"
 "$bin" restart 2>"$work/restart.log" || fail "restart ($?): $(cat "$work/restart.log" "$work/hammer.err" "$work/hammer.curl")"
 date +"restart end %T.%N" >>"$work/hammer.err"
