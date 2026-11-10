@@ -99,16 +99,6 @@ fn primary_setup_runs_until_it_succeeds_with_backoff() {
 }
 
 #[test]
-fn setup_marker_in_git_admin_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
-    let marker = setup_marker(dir.path()).unwrap();
-    assert_eq!(marker, repo.path().join("lazy-cow-tree-setup"));
-    assert!(marker.parent().unwrap().ends_with(".git"));
-    assert!(setup_marker(&dir.path().join("missing")).is_err());
-}
-
-#[test]
 fn pg_access_fails_closed() {
     let wt = co(Some("wt"));
     // Not a registered checkout's role: refused, whatever the database.

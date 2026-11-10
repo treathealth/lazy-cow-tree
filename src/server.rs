@@ -212,7 +212,7 @@ const DEPENDENCY_FILES: &[&str] = &[
     "composer.lock",
 ];
 
-fn is_dependency_file(path: &Path) -> bool {
+pub(crate) fn is_dependency_file(path: &Path) -> bool {
     path.file_name()
         .is_some_and(|n| DEPENDENCY_FILES.iter().any(|d| n == *d))
 }
@@ -385,13 +385,17 @@ fn failed(cmd: &str, why: &str, cwd: &Path, log_path: &Path) -> String {
 
 /// The project's setup command (`mix deps.get`) in a checkout whose dependency files
 /// changed, before restarting its services; appended to the log of its first run. A
-/// failure is only logged: the dependencies may be there already.
+/// failure is only logged: the dependencies may be there already. Success is
+/// recorded, so the next migrate doesn't run it again.
 async fn run_setup(project: &Project, c: &Checkout, g: &Global) {
     let Some(cmd) = &project.settings.setup else {
         return;
     };
     let id = c.run_id("setup");
-    if let Err(e) = run_logged(project, &c.path, &id, cmd, &c.path, c.env(g), true).await {
+    let result = run_logged(project, &c.path, &id, cmd, &c.path, c.env(g), true)
+        .await
+        .and_then(|()| crate::worktree::record_setup(&c.path));
+    if let Err(e) = result {
         warn!("{e:#}");
     }
 }

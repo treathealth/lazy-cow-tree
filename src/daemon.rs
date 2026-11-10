@@ -108,11 +108,7 @@ impl MigrateFailure {
     }
 }
 
-/// Marker of a checkout's succeeded setup, in its git admin dir (a worktree's goes
-/// away with it).
-fn setup_marker(path: &Path) -> Result<PathBuf> {
-    Ok(Repository::open(path)?.path().join(worktree::SETUP_MARKER))
-}
+use worktree::{SetupState, record_setup, setup_state};
 
 #[derive(Debug, PartialEq)]
 enum SetupStep {
@@ -207,9 +203,11 @@ impl ProjectRt {
         }
     }
 
-    /// A setup command is configured and hasn't succeeded in `c` yet.
+    /// A setup command is configured and hasn't succeeded in `c` yet, or its
+    /// dependency files changed since.
     fn setup_pending(&self, c: &Checkout) -> bool {
-        self.project.settings.setup.is_some() && setup_marker(&c.path).is_ok_and(|m| !m.exists())
+        self.project.settings.setup.is_some()
+            && setup_state(&c.path).is_ok_and(|s| s != SetupState::Current)
     }
 
     fn trigger(&self, flag: &AtomicBool) {
