@@ -156,21 +156,21 @@ impl Daemon {
         }
     }
 
-    /// The setup command in `c` unless its marker says it already succeeded there.
+    /// The setup command in `c` unless its marker says it already succeeded there
+    /// with the dependency files it has now.
     pub(super) async fn setup_once(&self, rt: &ProjectRt, c: &Checkout) -> Result<()> {
         let Some(cmd) = rt.project.settings.setup.clone() else {
             return Ok(());
         };
-        let marker = setup_marker(&c.path)?;
-        if marker.exists() {
+        if setup_state(&c.path)? == SetupState::Current {
             return Ok(());
         }
         let id = c.run_id("setup");
         self.run_command(rt, &c.path, &id, &cmd, &c.path, c.env(&self.global))
             .await
             .context("setup failed")?;
-        if let Err(e) = std::fs::write(&marker, config::now().to_string()) {
-            warn!("{}: {}: {e}", c.id(), marker.display());
+        if let Err(e) = record_setup(&c.path) {
+            warn!("{}: setup marker: {e:#}", c.id());
         }
         Ok(())
     }
@@ -339,6 +339,15 @@ impl Daemon {
             .await?
             .ok_or_else(|| anyhow!("{} vanished", c.dev_db()))?
             .to_string();
+        // A pull or merge changed its dependencies, also when no migration did (a new
+        // worktree's first setup runs on its own).
+        if setup_state(&c.path).is_ok_and(|s| s == SetupState::Stale) {
+            let result = self.setup_once(rt, c).await;
+            if let Err(e) = &result {
+                rt.migrated(c, Some(format!("{e:#}")));
+            }
+            result?;
+        }
         let marker = Repository::open(&c.path)
             .map(|r| r.path().join("lazy-cow-tree-migrated"))
             .ok();

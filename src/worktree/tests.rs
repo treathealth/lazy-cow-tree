@@ -54,6 +54,39 @@ fn fixture() -> (TempDir, Project, Syncer) {
 }
 
 #[test]
+fn setup_marker_in_git_admin_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let marker = setup_marker(dir.path()).unwrap();
+    assert_eq!(marker, repo.path().join("lazy-cow-tree-setup"));
+    assert!(marker.parent().unwrap().ends_with(".git"));
+    assert!(setup_marker(&dir.path().join("missing")).is_err());
+}
+
+#[test]
+fn setup_goes_stale_when_a_tracked_lockfile_changes() {
+    let (_d, project, _) = fixture();
+    let root = &project.root;
+    std::fs::create_dir(root.join("svc")).unwrap();
+    std::fs::write(root.join("svc/mix.lock"), "%{a: 1}\n").unwrap();
+    let repo = Repository::open(root).unwrap();
+    let mut idx = repo.index().unwrap();
+    idx.add_path(Path::new("svc/mix.lock")).unwrap();
+    idx.write().unwrap();
+    assert_eq!(setup_state(root).unwrap(), SetupState::Missing);
+    record_setup(root).unwrap();
+    assert_eq!(setup_state(root).unwrap(), SetupState::Current);
+    // Other files don't matter.
+    std::fs::write(root.join("a.txt"), "b\n").unwrap();
+    assert_eq!(setup_state(root).unwrap(), SetupState::Current);
+    // A pull or checkout rewrote the lockfile.
+    std::fs::write(root.join("svc/mix.lock"), "%{a: 2}\n").unwrap();
+    assert_eq!(setup_state(root).unwrap(), SetupState::Stale);
+    record_setup(root).unwrap();
+    assert_eq!(setup_state(root).unwrap(), SetupState::Current);
+}
+
+#[test]
 fn names_are_unique() {
     let (d, project, syncer) = fixture();
     // Long requested names that share their first 32 characters get their own.

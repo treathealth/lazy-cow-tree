@@ -212,7 +212,7 @@ const DEPENDENCY_FILES: &[&str] = &[
     "composer.lock",
 ];
 
-fn is_dependency_file(path: &Path) -> bool {
+pub(crate) fn is_dependency_file(path: &Path) -> bool {
     path.file_name()
         .is_some_and(|n| DEPENDENCY_FILES.iter().any(|d| n == *d))
 }
@@ -385,13 +385,25 @@ fn failed(cmd: &str, why: &str, cwd: &Path, log_path: &Path) -> String {
 
 /// The project's setup command (`mix deps.get`) in a checkout whose dependency files
 /// changed, before restarting its services; appended to the log of its first run. A
-/// failure is only logged: the dependencies may be there already.
-async fn run_setup(project: &Project, c: &Checkout, g: &Global) {
+/// failure is only logged: the dependencies may be there already. Skipped when
+/// setup already succeeded after `changed` were written (migrate saw them first).
+async fn run_setup(project: &Project, c: &Checkout, g: &Global, changed: &[PathBuf]) {
     let Some(cmd) = &project.settings.setup else {
         return;
     };
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    if let Some(done) = crate::worktree::setup_marker(&c.path)
+        .ok()
+        .and_then(|m| mtime(&m))
+        && changed.iter().all(|f| mtime(f).is_some_and(|t| t <= done))
+    {
+        return;
+    }
     let id = c.run_id("setup");
-    if let Err(e) = run_logged(project, &c.path, &id, cmd, &c.path, c.env(g), true).await {
+    let result = run_logged(project, &c.path, &id, cmd, &c.path, c.env(g), true)
+        .await
+        .and_then(|()| crate::worktree::record_setup(&c.path));
+    if let Err(e) = result {
         warn!("{e:#}");
     }
 }
@@ -570,7 +582,7 @@ impl Servers {
                 continue;
             }
             let mut restart = Vec::new();
-            let mut deps = false;
+            let mut deps = Vec::new();
             for id in ids {
                 let p = procs.get_mut(&id).unwrap();
                 if !p.alive() {
@@ -586,14 +598,14 @@ impl Servers {
                     .map(|f| f.strip_prefix(dir).unwrap_or(f).display().to_string())
                     .collect();
                 info!("{id}: {} changed; restarting", what.join(", "));
-                deps |= changed.iter().any(|f| is_dependency_file(f));
+                deps.extend(changed.into_iter().filter(|f| is_dependency_file(f)));
                 restart.push((id, p.started));
             }
             let Some((first, _)) = restart.first() else {
                 continue;
             };
             let p = &procs[first];
-            if !deps || p.project.settings.setup.is_none() {
+            if deps.is_empty() || p.project.settings.setup.is_none() {
                 for (id, _) in restart {
                     respawn(&id, procs.get_mut(&id).unwrap()).await;
                 }
@@ -603,7 +615,7 @@ impl Servers {
             let hold = self.hold(&path);
             let servers = self.clone();
             tokio::spawn(async move {
-                run_setup(&project, &c, &g).await;
+                run_setup(&project, &c, &g, &deps).await;
                 let mut procs = servers.procs.lock().await;
                 for (id, started) in restart {
                     // Not one stopped and started again meanwhile.
@@ -830,12 +842,22 @@ impl Servers {
         let setup = {
             let procs = self.procs.lock().await;
             let Some(p) = procs.get(id) else { return };
-            (p.project.settings.setup.is_some()
-                && p.changed_files().iter().any(|f| is_dependency_file(f)))
-            .then(|| (p.project.clone(), p.checkout.clone(), p.global.clone()))
+            let deps: Vec<PathBuf> = p
+                .changed_files()
+                .into_iter()
+                .filter(|f| is_dependency_file(f))
+                .collect();
+            (p.project.settings.setup.is_some() && !deps.is_empty()).then(|| {
+                (
+                    p.project.clone(),
+                    p.checkout.clone(),
+                    p.global.clone(),
+                    deps,
+                )
+            })
         };
-        if let Some((project, c, g)) = setup {
-            run_setup(&project, &c, &g).await;
+        if let Some((project, c, g, deps)) = setup {
+            run_setup(&project, &c, &g, &deps).await;
         }
         let mut procs = self.procs.lock().await;
         let Some(p) = procs.get_mut(id) else { return };

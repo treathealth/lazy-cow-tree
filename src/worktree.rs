@@ -388,6 +388,54 @@ const REBUILDABLE: &[&str] = &[
 /// Written in the worktree's git admin dir once its setup command succeeded.
 pub const SETUP_MARKER: &str = "lazy-cow-tree-setup";
 
+/// Marker of a checkout's succeeded setup, in its git admin dir (a worktree's goes
+/// away with it). Holds the dependency files it ran against.
+pub fn setup_marker(path: &Path) -> Result<PathBuf> {
+    Ok(Repository::open(path)?.path().join(SETUP_MARKER))
+}
+
+#[derive(Debug, PartialEq)]
+pub enum SetupState {
+    Missing,
+    /// Succeeded, but a pull or checkout changed a dependency file since (`mix.lock`):
+    /// migrations and services would meet outdated dependencies.
+    Stale,
+    Current,
+}
+
+pub fn setup_state(path: &Path) -> Result<SetupState> {
+    let Ok(recorded) = std::fs::read_to_string(setup_marker(path)?) else {
+        return Ok(SetupState::Missing);
+    };
+    Ok(if recorded == dependency_fingerprint(path)? {
+        SetupState::Current
+    } else {
+        SetupState::Stale
+    })
+}
+
+pub fn record_setup(path: &Path) -> Result<()> {
+    std::fs::write(setup_marker(path)?, dependency_fingerprint(path)?)?;
+    Ok(())
+}
+
+/// The checkout's tracked dependency manifests and lockfiles as they are on disk, a
+/// line of blob id and path each.
+fn dependency_fingerprint(path: &Path) -> Result<String> {
+    let repo = Repository::open(path)?;
+    let mut lines = String::new();
+    for e in repo.index()?.iter() {
+        let rel = String::from_utf8_lossy(&e.path);
+        if !crate::server::is_dependency_file(Path::new(&*rel)) {
+            continue;
+        }
+        let oid = Oid::hash_file(git2::ObjectType::Blob, path.join(&*rel))
+            .map_or_else(|_| "-".to_string(), |o| o.to_string());
+        lines.push_str(&format!("{oid} {rel}\n"));
+    }
+    Ok(lines)
+}
+
 /// When provisioning finished: the newest of the populated and setup markers.
 fn provisioned_at(path: &Path) -> Option<SystemTime> {
     let admin = Repository::open(path).ok()?.path().to_path_buf();

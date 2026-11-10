@@ -5,13 +5,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Unix seconds.
-pub fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 pub fn home() -> PathBuf {
     if let Some(h) = std::env::var_os("LAZY_COW_TREE_HOME") {
         return PathBuf::from(h);
